@@ -27,13 +27,14 @@ complementares, executadas em cascata:
    seguidas de linhas um pouco maiores — comportamento comum em formulários
    impressos linearizados.
 
-4. SIMULAÇÃO DE IA LOCAL (`extrair_com_ia`):
-   Camada final que recebe o texto bruto e devolve um JSON com todos os pares
-   encontrados. A implementação atual é determinística (baseada em sintaxe:
-   duas-pontos, capitalização, terminação pontual), mas a assinatura foi
-   desenhada para ser trocada por um LLM real (Ollama, llama.cpp, etc.) sem
-   alterar os consumidores: basta substituir o corpo da função pela chamada
-   HTTP/transformers e fazer `json.loads()` da resposta.
+4. IA QWEN VIA NAVEGADOR (`extrair_com_ia` / `consultar_qwen_encaixe`):
+   Camada final (e preferencial quando ativa). SEM NENHUMA CHAVE DE API: o
+   módulo `qwen_navegador` abre o chat.qwen.ai no Chromium com um perfil
+   persistente e usa a CONTA LOGADA do usuário para enviar o texto bruto do
+   documento; o Qwen devolve um JSON com todos os pares encontrados e/ou já
+   encaixados nos rótulos do formulário de destino. Se o navegador estiver
+   sem sessão ou o site falhar, degradamos para uma heurística determinística
+   local que devolve o MESMO formato de dados (extração continua offline).
 
 Saída unificada: lista de `DadoExtraido(chave_original, valor, fonte, confianca)`
 ordenada por página/posição de leitura, pronta para o mapeamento semântico do
@@ -264,9 +265,10 @@ class ExtratorPDF:
         resultado.dados = self._deduplicar(resultado.dados)
 
         # --- Estratégia 4: IA (Qwen) — SEMPRE ativa quando configurada ---
-        # Com backend de IA real configurado, o Qwen analisa o PDF em todas as
-        # extrações e decide onde cada informação se encaixa no formulário.
-        # Sem configuração, a heurística simulada só roda como fallback.
+        # O modo PADRÃO é o navegador com a conta logada do Qwen (sem API).
+        # O Qwen analisa o PDF em todas as extrações e decide onde cada
+        # informação se encaixa no formulário. Se o navegador falhar (login
+        # ausente, site fora do ar), degradamos para a heurística local.
         ia_sempre = self.usar_ia and bool(ConfigIAQwen.carregar())
         if self.usar_ia and resultado.texto_bruto.strip():
             # `encaixes` recebe as decisões do Qwen quando há formulário alvo;
@@ -275,6 +277,10 @@ class ExtratorPDF:
             if ia_sempre and self.rotulos_destino:
                 encaixes = consultar_qwen_encaixe(resultado.texto_bruto,
                                                   self.rotulos_destino)
+                if encaixes is None:
+                    resultado.avisos.append(
+                        "Qwen via navegador indisponível (faça login no botão "
+                        "'🤖 Qwen'); seguindo com extração estrutural.")
             estrutural_fraca = len(resultado.dados) < 3
             if encaixes is not None or estrutural_fraca:
                 if encaixes is not None:
@@ -308,8 +314,8 @@ class ExtratorPDF:
                         atual.fonte, atual.confianca = novo.fonte, novo.confianca
             elif self.usar_ia and not ia_sempre:
                 resultado.avisos.append(
-                    "IA indisponível/não configurada — usando apenas extração "
-                    "estrutural. Configure o Qwen para análise por IA.")
+                    "IA desligada na configuração — usando apenas extração "
+                    "estrutural. Ative o Qwen pelo navegador no botão '🤖 Qwen'.")
 
         resultado.dados = self._deduplicar(resultado.dados)
 
@@ -503,12 +509,16 @@ class ExtratorTXT:
             if par.chave_original.lower() not in cobertas:
                 resultado.dados.append(par)
 
-        # --- IA (Qwen): sempre que configurada; heurística local só como fallback ---
+        # --- IA (Qwen): sempre que configurada (padrão = navegador logado) ---
         ia_sempre = self.usar_ia and bool(ConfigIAQwen.carregar())
         if self.usar_ia and texto.strip():
             encaixes: Optional[list[EncaixeQwen]] = None
             if ia_sempre and self.rotulos_destino:
                 encaixes = consultar_qwen_encaixe(texto, self.rotulos_destino)
+                if encaixes is None:
+                    resultado.avisos.append(
+                        "Qwen via navegador indisponível (faça login no botão "
+                        "'🤖 Qwen'); seguindo com extração textual.")
             estrutural_fraca = len(resultado.dados) < 3
             if encaixes is not None or estrutural_fraca:
                 if encaixes is not None:
@@ -569,76 +579,118 @@ class ExtratorTXT:
 
 
 # ===========================================================================
-# 3) Camada de IA — Qwen real (Ollama / OpenAI-compatível) + simulação local
+# 3) Camada de IA — Qwen via NAVEGADOR (conta logada, sem API) como padrão;
+#    backends locais (Ollama / OpenAI-compatível) ficam opcionais.
 # ===========================================================================
+ARQ_CFG_IA: Path = Path.home() / ".autodoc_qwen.json"
+
+
 @dataclass
 class ConfigIAQwen:
     """
     Configuração do backend de IA (Qwen).
 
-    Prioridade de descoberta automática (via variáveis de ambiente):
-      1. `QWEN_BASE_URL` definido  -> API OpenAI-compatível (/chat/completions)
-         com `QWEN_API_KEY` opcional e `QWEN_MODEL` (padrão "qwen2.5:7b").
-      2. Ollama local disponível   -> http://localhost:11434, modelo
-         `QWEN_MODEL` (padrão "qwen2.5:7b-instruct").
-      3. Nenhuma das anteriores    -> None => o sistema usa a heurística
-         determinística (`extrair_com_ia`) como simulação de IA.
+    MODOS SUPORTADOS (campo `estilo`):
+      * "navegador"  -> MODO PADRÃO e RECOMENDADO. Nenhuma chave de API é
+        usada: o módulo `qwen_navegador` abre o chat.qwen.ai no Chromium com
+        um perfil persistente (`~/.autodoc_qwen_profile`) e conversa com o
+        Qwen usando a CONTA LOGADA DO USUÁRIO no navegador. Login feito uma
+        única vez reaproveita a sessão automaticamente.
+      * "ollama"/"openai" -> modosopcionais para quem preferir rodar o modelo
+        localmente (só ativados quando QWEN_BASE_URL/QWEN_MODEL apontam para
+        um servidor local acessível; nunca exigem conta na nuvem).
+      * None (carregar() devolve None) -> sem IA: cascata estrutural +
+        heurística local continua funcionando 100% offline.
+
+    Persistência: a escolha do usuário é gravada em `~/.autodoc_qwen.json`
+    (via `salvar()`), com override por variáveis de ambiente.
 
     Attributes:
-        base_url: URL raiz do servidor (sem /chat/...).
-        api_key: token Bearer (vazio para Ollama).
-        modelo: nome do modelo Qwen servido.
-        estilo: "ollama" (endpoint /api/generate) ou "openai" (/v1/chat/completions).
-        timeout: segundos de espera máxima por chamada.
+        estilo: "navegador" | "ollama" | "openai".
+        base_url/api_key/modelo: usados apenas nos modos locais opcionais.
+        timeout: segundos de espera máxima por análise.
     """
-    base_url: str
-    api_key: str
-    modelo: str
-    estilo: str = "openai"
-    timeout: float = 120.0
+    estilo: str = "navegador"
+    base_url: str = ""
+    api_key: str = ""
+    modelo: str = "Qwen (conta do navegador)"
+    timeout: float = 240.0
+
+    # -------------------------------------------------------- persistência
+    @staticmethod
+    def _ler_arquivo() -> dict[str, Any]:
+        """Lê o JSON de configuração do usuário ({} se ausente/corrompido)."""
+        try:
+            dados = json.loads(ARQ_CFG_IA.read_text(encoding="utf-8"))
+            return dados if isinstance(dados, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def salvar(self) -> None:
+        """Grava esta configuração no arquivo de usuário (~/.autodoc_qwen.json)."""
+        try:
+            ARQ_CFG_IA.write_text(json.dumps(asdict(self), ensure_ascii=False,
+                                             indent=2), encoding="utf-8")
+        except OSError as exc:  # disco cheio/sem permissão: segue em memória
+            logger.warning("Não foi possível salvar a config de IA: %s", exc)
 
     @classmethod
     def carregar(cls) -> Optional["ConfigIAQwen"]:
         """
-        Monta a configuração a partir do ambiente; retorna None se não houver
-        backend de IA real configurado/acessível.
+        Resolve o backend ativo, nesta prioridade:
 
-        A detecção do Ollama é feita uma única vez por processo (cache) para
-        não pagar latência de rede em toda extração.
+        1. AUTODOC_IA_OFF=1           -> None (IA desligada explicitamente).
+        2. QWEN_BASE_URL no ambiente  -> modo local opcional (ollama/openai).
+        3. Arquivo ~/.autodoc_qwen.json -> escolha salva pelo usuário na GUI
+           ("navegador" => sempre ativo; "local" => sonda o Ollama).
+        4. Sem nada configurado       -> MODO PADRÃO: navegador com a conta
+           logada do Qwen (funciona mesmo sem arquivo de config).
+
+        Returns:
+            ConfigIAQwen ativa, ou None somente quando a IA foi desligada.
         """
         global _CFG_CACHE, _CFG_RESOLVIDO
         if _CFG_RESOLVIDO:
             return _CFG_CACHE
 
-        modelo = os.environ.get("QWEN_MODEL", "")
-        base = os.environ.get("QWEN_BASE_URL", "").rstrip("/")
-        key = os.environ.get("QWEN_API_KEY", "")
-        if base:
-            estilo = "ollama" if "11434" in base else "openai"
-            _CFG_CACHE = cls(base_url=base, api_key=key,
-                             modelo=modelo or "qwen2.5:7b", estilo=estilo)
-        elif not modelo and os.environ.get("AUTODOC_IA_OFF", "") == "1":
-            _CFG_CACHE = None  # opt-out explícito de rede
+        cfg: Optional[ConfigIAQwen] = None
+        if os.environ.get("AUTODOC_IA_OFF", "") == "1":
+            cfg = None
         else:
-            _CFG_CACHE = cls._detectar_ollama(modelo or "qwen2.5:7b-instruct")
+            salvo = cls._ler_arquivo()
+            base = os.environ.get("QWEN_BASE_URL", "").strip().rstrip("/")
+            if base:  # override explícito por API local (modo opcional)
+                estilo = "ollama" if "11434" in base else "openai"
+                cfg = cls(estilo=estilo, base_url=base,
+                          api_key=os.environ.get("QWEN_API_KEY", ""),
+                          modelo=os.environ.get("QWEN_MODEL", "") or "qwen2.5:7b")
+            elif salvo.get("estilo") == "local":
+                cfg = cls._detectar_local(salvo)
+            elif salvo.get("estilo") == "nenhum":
+                cfg = None
+            else:  # "navegador" ou primeira execução => padrão do projeto
+                cfg = cls(estilo="navegador",
+                          modelo=salvo.get("modelo") or "Qwen (conta do navegador)")
+        _CFG_CACHE = cfg
         _CFG_RESOLVIDO = True
         return _CFG_CACHE
 
     @staticmethod
-    def _detectar_ollama(modelo: str) -> Optional["ConfigIAQwen"]:
-        """Verifica rapidamente se há um Ollama local respondendo."""
-        url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+    def _detectar_local(salvo: dict[str, Any]) -> Optional["ConfigIAQwen"]:
+        """Sonda um backend LOCAL (Ollama) — usado só se o usuário escolher."""
+        url = (salvo.get("base_url")
+               or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
+        modelo = salvo.get("modelo") or "qwen2.5:7b-instruct"
         try:
             import requests
             r = requests.get(f"{url}/api/tags", timeout=1.5)
             if r.ok:
                 nomes = [m.get("name", "") for m in r.json().get("models", [])]
-                # escolhe o modelo pedido, ou qualquer qwen disponível
                 escolhido = modelo if any(n.startswith(modelo) for n in nomes) else next(
                     (n for n in nomes if "qwen" in n.lower()), modelo)
-                logger.info("Ollama detectado em %s (modelo=%s)", url, escolhido)
-                return ConfigIAQwen(base_url=url, api_key="", modelo=escolhido,
-                                    estilo="ollama")
+                logger.info("Ollama local detectado em %s (modelo=%s)", url, escolhido)
+                return ConfigIAQwen(estilo="ollama", base_url=url,
+                                    api_key="", modelo=escolhido)
         except Exception as exc:  # noqa: BLE001 - rede é falível por natureza
             logger.debug("Ollama indisponível: %s", exc)
         return None
@@ -658,12 +710,28 @@ def _chamar_qwen(prompt: str, cfg: ConfigIAQwen) -> str:
     """
     Envia o prompt ao Qwen e devolve o texto cru da resposta.
 
-    Suporta dois protocolos:
-      * Ollama: POST {base}/api/generate {"model","prompt","stream":false}
-      * OpenAI-compatível (vLLM, LM Studio, Groq, OpenRouter...):
-        POST {base}/v1/chat/completions com mensagens user/assistant.
-    Usa `requests` quando disponível; senão, `urllib` (stdlib) como fallback.
+    Roteamento pelo modo ativo (`cfg.estilo`):
+      * "navegador" (PADRÃO do projeto, SEM API): delega ao módulo
+        `qwen_navegador`, que abre o chat.qwen.ai no Chromium com perfil
+        persistente e usa a CONTA LOGADA do usuário para conversar com o
+        modelo — nenhuma chave de API ou servidor local é necessário.
+      * "ollama": POST {base}/api/generate {"model","prompt","stream":false}.
+      * "openai": POST {base}/v1/chat/completions (vLLM, LM Studio...).
+    Os modos locais são opcionais e usam `requests` quando disponível;
+    senão, `urllib` (stdlib) como fallback.
+
+    Raises:
+        RuntimeError: navegador/serve indisponível ou resposta malformada —
+            o chamador degrada graciosamente para a heurística local.
     """
+    if cfg.estilo == "navegador":
+        # Import tardio: mantém o extractor utilizável mesmo sem Playwright.
+        import qwen_navegador as qn
+        motor_cfg = qn.ConfigQwenNavegador.carregar()
+        motor_cfg.timeout_resposta = cfg.timeout
+        motor = qn.MotorQwenNavegador(motor_cfg)
+        return motor.perguntar(prompt)
+
     payload: dict[str, Any]
     if cfg.estilo == "ollama":
         url = f"{cfg.base_url}/api/generate"
@@ -711,11 +779,17 @@ def _extrair_json(resposta: str) -> list[Any]:
 
     LLMs costumam envolver o JSON em cercas ```json ... ``` ou texto extra;
     esta função localiza o primeiro '[' balanceado e faz json.loads tolerante.
+    No modo navegador isso é ainda mais importante, pois o chat frequentemente
+    responde com prosa + bloco de código.
     """
-    m = re.search(r"\[.*\]", resposta, flags=re.DOTALL)
-    if not m:
-        raise ValueError(f"Nenhum JSON encontrado na resposta: {resposta[:200]!r}")
-    return json.loads(m.group(0))
+    try:
+        import qwen_navegador as qn
+        return qn.extrair_json_da_resposta(resposta)
+    except ImportError:  # pragma: no cover - módulo sempre acompanha o app
+        m = re.search(r"\[.*\]", resposta, flags=re.DOTALL)
+        if not m:
+            raise ValueError(f"Nenhum JSON encontrado na resposta: {resposta[:200]!r}")
+        return json.loads(m.group(0))
 
 
 PROMPT_ENCAIXE_TEMPLATE: str = """\
@@ -758,6 +832,10 @@ def consultar_qwen_encaixe(texto_documento: str,
         Lista de `EncaixeQwen` (pode ser vazia se o modelo não achar nada),
         ou None se não houver backend configurado / a chamada falhar — nesse
         caso o chamador mantém apenas a extração estrutural/heurística.
+
+    Nota sobre o modo navegador: quando o Qwen é acessado pela conta logada
+    no navegador, uma janela Chromium visível abre em cada análise (é assim
+    que o usuário acompanha o login e evita bloqueios de automação).
     """
     cfg = ConfigIAQwen.carregar()
     if cfg is None:
@@ -799,13 +877,15 @@ def extrair_com_ia(texto_bruto: str,
     """
     Camada de IA com duas implementações possíveis:
 
-    1) QWEN REAL (preferencial, quando configurado):
-       Detecta automaticamente Ollama local ou endpoint OpenAI-compatível via
-       variáveis de ambiente (QWEN_BASE_URL / QWEN_API_KEY / QWEN_MODEL).
-       O modelo recebe TODO o texto do documento e devolve um JSON com todos
-       os pares chave-valor encontrados (extração total, sem listas fixas).
+    1) QWEN VIA NAVEGADOR (padrão do projeto, quando a IA está ativa):
+       Sem chave de API: o módulo `qwen_navegador` usa a CONTA LOGADA do
+       usuário no chat.qwen.ai (perfil persistente do Chromium) para enviar
+       TODO o texto do documento; o modelo devolve um JSON com todos os pares
+       chave-valor encontrados (extração total, sem listas fixas). Modos
+       locais opcionais (Ollama/OpenAI-compatível) permanecem suportados para
+       quem preferir rodar o modelo na própria máquina.
 
-    2) SIMULAÇÃO DETERMINÍSTICA (fallback offline):
+    2) HEURÍSTICA DETERMINÍSTICA (fallback offline / IA desligada):
        Percorre as linhas reconhecendo pares por sinais sintáticos
        (dois-pontos, capitalização de rótulo, terminação) e devolve o MESMO
        formato que o modelo real retornaria — assim os consumidores
@@ -816,8 +896,8 @@ def extrair_com_ia(texto_bruto: str,
         rotulos_destino: rótulos do formulário alvo (contexto extra p/ o Qwen).
 
     Returns:
-        Lista de `DadoExtraido`; fonte=IA_QWEN quando o modelo real respondeu,
-        fonte=IA_LOCAL na simulação.
+        Lista de `DadoExtraido`; fonte=IA_QWEN quando o Qwen respondeu (pelo
+        navegador ou backend local), fonte=IA_LOCAL na heurística.
     """
     cfg = ConfigIAQwen.carregar()
     if cfg is not None:

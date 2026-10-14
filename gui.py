@@ -96,6 +96,9 @@ class AplicacaoPreenchimento:
         st.configure("TNotebook.Tab", padding=(14, 8), font=("Segoe UI", 10, "bold"))
         st.configure("Card.TFrame", background=COR_PAINEL, relief="flat")
         st.configure("TLabel", background=COR_PAINEL)
+        st.configure("TLabelframe", background=COR_PAINEL)
+        st.configure("TLabelframe.Label", background=COR_PAINEL)
+        st.configure("TCheckbutton", background=COR_FUNDO)
         st.configure("Titulo.TLabel", background=COR_PAINEL,
                      font=("Segoe UI", 11, "bold"), foreground="#111827")
         st.configure("TButton", padding=(10, 6), font=("Segoe UI", 10, "bold"))
@@ -441,16 +444,18 @@ class AplicacaoPreenchimento:
                 "Reanálise", "Carregue a ORIGEM e o DESTINO antes de usar a IA.")
             return
         if not ConfigIAQwen.carregar():
+            # IA desligada na configuração -> oferece religar pelo navegador.
             self._dialogo_ia()
             if not ConfigIAQwen.carregar():
                 messagebox.showinfo(
                     "IA indisponível",
-                    "Nenhum backend Qwen configurado/acessível.\n"
+                    "A IA Qwen está desligada na configuração.\n"
                     "O sistema seguirá apenas com o mapeamento heurístico.")
                 return
         texto = self.resultado.texto_bruto
         rotulos = [c.rotulo for c in self.campos_destino]
-        self._set_status("🤖 Qwen analisando o documento e propondo encaixes ...")
+        self._set_status("🤖 Qwen (conta do navegador) analisando o documento e "
+                         "propondo encaixes — aguarde a janela do chat ...")
         threading.Thread(target=self._reanalise_bg, args=(texto, rotulos),
                          daemon=True).start()
 
@@ -470,8 +475,10 @@ class AplicacaoPreenchimento:
             self._set_status("Reanálise com IA falhou.")
             return
         if not encaixes:
-            self._set_status("Qwen não retornou encaixes (resposta vazia ou "
-                             "modelo fora do ar); mantendo mapeamento atual.")
+            self._set_status("Qwen não retornou encaixes (login pendente, janela "
+                             "fechada antes da resposta ou site fora do ar); "
+                             "mantendo mapeamento atual. Use '🤖 Qwen' para "
+                             "verificar a sessão do navegador.")
             return
         self._encaixes_brutos = encaixes
         qwen_ok = sum(1 for e in encaixes if e.confianca >= 0.75)
@@ -482,96 +489,202 @@ class AplicacaoPreenchimento:
 
     def _dialogo_ia(self) -> None:
         """
-        Janela de configuração do backend Qwen.
+        Janela de configuração do Qwen — MODO PADRÃO: CONTA LOGADA NO NAVEGADOR.
 
-        Permite apontar para Ollama local ou qualquer API OpenAI-compatível
-        (vLLM, LM Studio, Groq, OpenRouter...) sem editar variáveis de
-        ambiente. Ao salvar, grava QWEN_BASE_URL/QWEN_MODEL/QWEN_API_KEY no
-        processo, limpa o cache de detecção e faz um teste de conectividade.
+        Não há campo de API Key obrigatório: o programa automatiza o site
+        chat.qwen.ai com Playwright usando um perfil persistente do Chromium
+        (~/.autodoc_qwen_profile). O fluxo humano é:
+          1. Clique em "🌐 Abrir navegador e conectar minha conta".
+          2. Faça login no Qwen na janela que abrir (e-mail/QR/Google).
+          3. Feche a janela de teste e clique em "Salvar e testar" — a sessão
+             fica gravada e toda análise futura usa sua conta, sem API.
+        O modo local (Ollama) continua disponível como opção avançada para
+        quem preferir rodar o modelo na própria máquina.
         """
+        import qwen_navegador as qn
+
         win = tk.Toplevel(self.root)
-        win.title("🤖 IA Qwen — configuração do backend")
+        win.title("🤖 Qwen — conexão pela conta do navegador (sem API)")
         win.configure(bg=COR_PAINEL)
         win.resizable(False, False)
         win.transient(self.root)
         win.grab_set()
 
-        ttk.Label(win, text="Backend de IA (Qwen)", style="Titulo.TLabel"
-                  ).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 4))
-        ttk.Label(win, text="Base URL  (ex.: http://localhost:11434 ou https://api.../v1):",
-                  background=COR_PAINEL).grid(row=1, column=0, sticky="w", padx=14, pady=4)
-        ent_url = ttk.Entry(win, width=46)
-        ent_url.grid(row=1, column=1, sticky="we", padx=(0, 14), pady=4)
-        ttk.Label(win, text="Modelo  (ex.: qwen2.5:7b-instruct):",
-                  background=COR_PAINEL).grid(row=2, column=0, sticky="w", padx=14, pady=4)
-        ent_modelo = ttk.Entry(win, width=46)
-        ent_modelo.grid(row=2, column=1, sticky="we", padx=(0, 14), pady=4)
-        ttk.Label(win, text="API Key  (opcional / vazio p/ Ollama):",
-                  background=COR_PAINEL).grid(row=3, column=0, sticky="w", padx=14, pady=4)
-        ent_key = ttk.Entry(win, width=46, show="*")
-        ent_key.grid(row=3, column=1, sticky="we", padx=(0, 14), pady=4)
+        ttk.Label(win, text="Como o AutoDoc fala com o Qwen", style="Titulo.TLabel"
+                  ).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 2))
+        ttk.Label(
+            win, wraplength=560, justify="left", background=COR_PAINEL,
+            foreground="#374151",
+            text=("NENHUMA chave de API é usada. O programa abre o chat.qwen.ai "
+                  "em um navegador dedicado e conversa com o Qwen aproveitando a "
+                  "SUA CONTA JÁ LOGADA. O login é feito uma única vez: a sessão "
+                  "fica salva no perfil ~/.autodoc_qwen_profile e é reaproveitada "
+                  "em todas as análises.")
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 8))
 
-        # Pré-preenche com a configuração já detectada (se houver)
-        cfg = ConfigIAQwen.carregar()
-        if cfg:
-            ent_url.insert(0, cfg.base_url)
-            ent_modelo.insert(0, cfg.modelo)
-            ent_key.insert(0, cfg.api_key)
+        # --- Bloco principal: navegador / conta logada -------------------
+        grp_nav = ttk.LabelFrame(win, text=" 🌐 Modo recomendado: conta logada no navegador ")
+        grp_nav.grid(row=2, column=0, columnspan=2, sticky="we", padx=14, pady=6)
+        ttk.Label(grp_nav,
+                  text=f"URL do chat: {qn.URL_CHAT}").pack(anchor="w", padx=10, pady=(6, 0))
+        ttk.Label(grp_nav,
+                  text=f"Perfil do navegador: {qn.PERFIL_DIR}").pack(anchor="w", padx=10)
 
-        lbl_res = ttk.Label(win, text="", background=COR_PAINEL, wraplength=520,
+        lbl_res = ttk.Label(win, text="", wraplength=560,
                             foreground="#374151", justify="left")
-        lbl_res.grid(row=4, column=0, columnspan=2, sticky="we", padx=14, pady=6)
+        lbl_res.grid(row=5, column=0, columnspan=2, sticky="we", padx=14, pady=6)
 
-        def salvar() -> None:
-            """Aplica a configuração ao ambiente do processo e testa a conexão."""
-            import os as _os
-            url = ent_url.get().strip().rstrip("/")
-            modelo = ent_modelo.get().strip()
-            key = ent_key.get().strip()
-            if not url:
-                _os.environ.pop("QWEN_BASE_URL", None)
-                _os.environ["AUTODOC_IA_OFF"] = "1"
-                lbl_res.config(text="IA desativada — usando heurística local.",
-                               foreground=COR_WARN)
-            else:
-                _os.environ.pop("AUTODOC_IA_OFF", None)
-                _os.environ["QWEN_BASE_URL"] = url
-                if modelo:
-                    _os.environ["QWEN_MODEL"] = modelo
-                if key:
-                    _os.environ["QWEN_API_KEY"] = key
-                reset_cache_ia()
-                new_cfg = ConfigIAQwen.carregar()
-                if new_cfg is None:
-                    lbl_res.config(text=f"⚠ Não foi possível contatar {url}. "
-                                       "Verifique se o servidor está ativo.",
-                                   foreground=COR_ERRO)
-                else:
-                    lbl_res.config(
-                        text=f"✔ Backend salvo: {new_cfg.estilo} @ {new_cfg.base_url} "
-                             f"(modelo {new_cfg.modelo}). Clique em '🧠 Reanalisar com IA'.",
-                        foreground=COR_OK)
+        def definir_navegador() -> None:
+            """Grava o modo navegador como backend ativo."""
+            ConfigIAQwen(estilo="navegador").salvar()
+            reset_cache_ia()
             self.cfg_ia = ConfigIAQwen.carregar()
             self._atualizar_label_ia()
+            lbl_res.config(text="✔ Modo 'conta do navegador' ativado.",
+                           foreground=COR_OK)
+
+        def abrir_login() -> None:
+            """Abre o chat do Qwen na janela persistente p/ login manual."""
+            lbl_res.config(text="Abrindo o navegador… faça login do Qwen nessa "
+                                "janela; depois volte aqui e clique em "
+                                "'Salvar e testar'.", foreground="#374151")
+
+            def bg() -> None:
+                try:
+                    motor = qn.MotorQwenNavegador(qn.ConfigQwenNavegador.carregar())
+                    motor.abrir_chat(novo_chat=False)
+                    ok = motor.esta_logado()
+                    if not ok:
+                        # mantém a janela aberta p/ o usuário logar
+                        msg = ("Janela do Qwen aberta. Faça LOGIN nela; quando o "
+                               "chat aparecer, feche esta caixa de teste e clique "
+                               "em 'Salvar e testar'.")
+                        self.root.after(0, lambda: lbl_res.config(
+                            text="⚠ " + msg, foreground=COR_WARN))
+                        return
+                    definir_navegador()
+                    self.root.after(0, lambda: (lbl_res.config(
+                        text="✔ Login encontrado! A conta do navegador será usada "
+                             "para analisar os documentos.", foreground=COR_OK),
+                        messagebox.showinfo(
+                            "Qwen conectado",
+                            "Sua conta logada no navegador foi detectada.\n"
+                            "As análises passarão por ela — sem API.")))
+                except Exception as exc:  # noqa: BLE001 - fronteira de robustez
+                    self.root.after(0, lambda: lbl_res.config(
+                        text=f"✖ {exc}", foreground=COR_ERRO))
+
+            threading.Thread(target=bg, daemon=True).start()
+
+        botoes_nav = ttk.Frame(grp_nav)
+        botoes_nav.pack(fill="x", padx=10, pady=8)
+        ttk.Button(botoes_nav, text="🌐 Abrir navegador e conectar minha conta",
+                   style="Primario.TButton", command=abrir_login).pack(side="left")
+        ttk.Button(botoes_nav, text="Usar este modo",
+                   command=definir_navegador).pack(side="right")
+
+        # --- Bloco opcional: modelo local (avançado) ----------------------
+        grp_local = ttk.LabelFrame(win, text=" ⚙ Modo avançado (opcional): Ollama local — não usado por padrão ")
+        grp_local.grid(row=3, column=0, columnspan=2, sticky="we", padx=14, pady=6)
+        ttk.Label(grp_local, text="Base URL:").grid(row=0, column=0, sticky="w", padx=10, pady=4)
+        ent_url = ttk.Entry(grp_local, width=40)
+        ent_url.insert(0, "http://localhost:11434")
+        ent_url.grid(row=0, column=1, sticky="we", padx=(0, 10), pady=4)
+        ttk.Label(grp_local, text="Modelo:").grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        ent_modelo = ttk.Entry(grp_local, width=40)
+        ent_modelo.insert(0, "qwen2.5:7b-instruct")
+        ent_modelo.grid(row=1, column=1, sticky="we", padx=(0, 10), pady=4)
+        grp_local.columnconfigure(1, weight=1)
+
+        def definir_local() -> None:
+            """Ativa o modo local apenas se o servidor estiver acessível."""
+            url = ent_url.get().strip().rstrip("/")
+            modelo = ent_modelo.get().strip()
+            if not url:
+                lbl_res.config(text="Informe uma Base URL para o modo local.",
+                               foreground=COR_WARN)
+                return
+            cfg = ConfigIAQwen(estilo="local", base_url=url, api_key="",
+                               modelo=modelo or "qwen2.5:7b-instruct")
+            detectado = ConfigIAQwen._detectar_local({"base_url": url,
+                                                      "modelo": modelo})
+            if detectado is None:
+                lbl_res.config(
+                    text=f"⚠ Nenhum servidor de IA local respondendo em {url}. "
+                         "Mantenha o modo navegador (recomendado).",
+                    foreground=COR_WARN)
+                return
+            cfg.estilo = "local"
+            cfg.salvar()
+            reset_cache_ia()
+            self.cfg_ia = ConfigIAQwen.carregar()
+            self._atualizar_label_ia()
+            lbl_res.config(text=f"✔ Backend local salvo ({detectado.modelo}).",
+                           foreground=COR_OK)
+
+        botoes_loc = ttk.Frame(grp_local)
+        botoes_loc.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(2, 8))
+        ttk.Button(botoes_loc, text="Usar Ollama local",
+                   command=definir_local).pack(side="right", padx=(6, 0))
+
+        # --- Desligar IA ---------------------------------------------------
+        grp_off = ttk.Frame(win)
+        grp_off.grid(row=4, column=0, columnspan=2, sticky="ew", padx=14)
+        chk_desligar = ttk.Checkbutton(
+            grp_off, text="Desligar a IA (usar só extração estrutural/heurística)")
+        chk_desligar.pack(side="left")
+
+        def salvar_fechando() -> None:
+            if chk_desligar.get():
+                ConfigIAQwen(estilo="nenhum").salvar()
+            elif self.cfg_ia and self.cfg_ia.estilo == "navegador":
+                ConfigIAQwen(estilo="navegador").salvar()
+            reset_cache_ia()
+            self.cfg_ia = ConfigIAQwen.carregar()
+            self._atualizar_label_ia()
+            win.destroy()
 
         botoes = ttk.Frame(win)
-        botoes.grid(row=5, column=0, columnspan=2, sticky="ew", padx=14, pady=(4, 12))
-        ttk.Button(botoes, text="💾 Salvar e testar", style="Primario.TButton",
-                   command=salvar).pack(side="right", padx=(6, 0))
+        botoes.grid(row=6, column=0, columnspan=2, sticky="ew", padx=14, pady=(4, 12))
+        ttk.Button(botoes, text="💾 Salvar e fechar", style="Primario.TButton",
+                   command=salvar_fechando).pack(side="right", padx=(6, 0))
         ttk.Button(botoes, text="Fechar", command=win.destroy).pack(side="right")
+        win.columnconfigure(0, weight=1)
         win.columnconfigure(1, weight=1)
+
+        # Estado atual já visível ao abrir
+        cfg = ConfigIAQwen.carregar()
+        if cfg is None:
+            lbl_res.config(text="IA desligada atualmente.", foreground=COR_WARN)
+        elif cfg.estilo == "navegador":
+            pronto = qn.disponivel()
+            lbl_res.config(
+                text=("✔ Modo navegador ativo" +
+                      (" — sessão de login já encontrada!" if pronto else
+                       ". Clique em 'Abrir navegador e conectar minha conta' "
+                        "para fazer o primeiro login.")),
+                foreground=COR_OK if pronto else "#374151")
+        else:
+            lbl_res.config(text=f"Backend local ativo: {cfg.base_url}",
+                          foreground=COR_OK)
 
     def _atualizar_label_ia(self) -> None:
         """Mostra no topo o estado real do backend Qwen."""
+        import qwen_navegador as qn
         cfg = self.cfg_ia
-        if cfg:
+        if cfg is None:
             self.lbl_ia.config(
-                text=f"🤖 Qwen: {cfg.modelo} @ {cfg.base_url} ({cfg.estilo})",
-                foreground=COR_OK)
+                text="🤖 Qwen: desligado (heurística local + fuzzy)",
+                foreground=COR_WARN)
+        elif cfg.estilo == "navegador":
+            sessao = "sessão salva ✔" if qn.disponivel() else "clique em 🤖 Qwen p/ login"
+            self.lbl_ia.config(
+                text=f"🤖 Qwen: conta logada no navegador ({sessao})",
+                foreground=COR_OK if qn.disponivel() else COR_WARN)
         else:
             self.lbl_ia.config(
-                text="🤖 Qwen: não configurado (heurística local + fuzzy)",
-                foreground=COR_WARN)
+                text=f"🤖 Qwen: {cfg.modelo} @ {cfg.base_url} (local/{cfg.estilo})",
+                foreground=COR_OK)
 
     def _remapear_manual(self, m: MapeamentoCampo, chave: str,
                          var_valor: tk.StringVar) -> None:
