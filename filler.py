@@ -35,7 +35,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from extractor import DadoExtraido
+from extractor import DadoExtraido, Fonte
 
 logger = logging.getLogger("filler")
 
@@ -72,12 +72,28 @@ class CampoDestino:
 
 @dataclass
 class MapeamentoCampo:
-    """Par (campo de destino -> dado de origem) com score de confiança."""
+    """
+    Par (campo de destino -> dado de origem) com score de confiança.
+
+    Attributes:
+        campo: O widget/lacuna do formulário alvo.
+        dado: O `DadoExtraido` escolhido (heurístico ou pela IA Qwen).
+        score: Confiança final do encaixe (0..1).
+        status: Estado atual (OK / REVISAO / SEM_DADO / PREENCHIDO / FALHA).
+        valor_final: O que será efetivamente gravado no destino.
+        justificativa: Explicação legível de POR QUE este dado foi encaixado
+            neste campo — preenchida pela IA Qwen (ou pelo matching heurístico)
+            e exibida na GUI para permitir revisão informada pelo usuário.
+        origem_encaixe: Quem decidiu o encaixe: "qwen" (IA real), "heuristica"
+            (similaridade fuzzy/neural) ou "manual" (override do usuário).
+    """
     campo: CampoDestino
     dado: Optional[DadoExtraido] = None
     score: float = 0.0
     status: StatusCampo = StatusCampo.SEM_DADO
     valor_final: str = ""
+    justificativa: str = ""
+    origem_encaixe: str = "heuristica"
 
     @property
     def precisa_revisao(self) -> bool:
@@ -200,19 +216,69 @@ class MapeadorSemanticos:
         self.limiar = limiar
 
     def mapear(self, campos: list[CampoDestino],
-               dados: list[DadoExtraido]) -> list[MapeamentoCampo]:
+               dados: list[DadoExtraido],
+               encaixes_ia: Optional[list[Any]] = None) -> list[MapeamentoCampo]:
         """
-        Para CADA campo de destino, encontra o dado de origem com maior
-        similaridade de rótulo. Um mesmo dado pode servir a vários campos
-        (ex.: dois campos "telefone"), mas nunca deixamos um campo sem melhor
-        candidato — ele será marcado para revisão humana.
+        Estratégia de encaixe em DUAS CAMADAS:
+
+        1. IA QWEN (camada preferencial): cada `EncaixeQwen` retornado por
+           `consultar_qwen_encaixe()` já traz o par
+           (rotulo_destino -> valor adaptado + justificativa). O rótulo é
+           casado com os campos do destino (exact-after-normalization e, se
+           necessário, fuzzy >= limiar). Quando há match, o campo recebe o
+           encaixe da IA com confiança/justificativa dela — sem passar pela
+           heurística. Os dados de origem cuja chave foi nomeada pela própria
+           IA (`Fonte.IA_QWEN`) são anexados ao mapa para rastreabilidade.
+
+        2. HEURÍSTICA SEMÂNTICA (camada de fallback): para os campos que a IA
+           NÃO cobriu (IA ausente, falhou ou omitiu o campo por não haver dado
+           no documento), roda o matching clássico de similaridade entre o
+           rótulo do campo e as chaves extraídas — score >= limiar => OK,
+           abaixo => REVISAO_NECESÁRIA, sem candidato => SEM_DADO.
+
+        Args:
+            campos: Campos coletados do destino (web/PDF/TXT).
+            dados: Todos os `DadoExtraido` da origem.
+            encaixes_ia: Lista de `extractor.EncaixeQwen` (ou None) produzida
+                durante a extração; tipada como Any aqui para evitar ciclo de
+                import em tempo de execução.
 
         Returns:
-            Lista de `MapeamentoCampo` com status OK ou REVISAO/SEM_DADO.
+            Lista de `MapeamentoCampo`; cada item carrega `origem_encaixe`
+            ("qwen" | "heuristica") e `justificativa` exibíveis na GUI.
         """
         mapas: list[MapeamentoCampo] = []
+        cobertos: set[int] = set()
+
+        # ---------- Camada 1: decisões de encaixe vindas do Qwen ----------
+        por_chave = {d.chave_original: d for d in dados}
+        for e in (encaixes_ia or []):
+            alvo = self._casar_rotulo(getattr(e, "rotulo_destino", ""), campos)
+            if alvo is None or alvo in cobertos:
+                continue  # IA citou um rótulo que não existe no formulário
+            cobertos.add(alvo)
+            campo = campos[alvo]
+            # tenta vincular ao dado de origem correspondente (rastreabilidade)
+            d = por_chave.get(getattr(e, "chave_origem", "")) \
+                or por_chave.get(campo.rotulo) \
+                or next((x for x in dados
+                         if x.fonte == Fonte.IA_QWEN.value
+                         and _normalizar(x.chave_original) == _normalizar(campo.rotulo)),
+                        None)
+            conf = float(getattr(e, "confianca", 0.8))
+            just = str(getattr(e, "justificativa", "") or "").strip()
+            mapas.append(MapeamentoCampo(
+                campo=campo, dado=d, score=conf,
+                status=StatusCampo.OK if conf >= self.limiar else StatusCampo.REVISAO,
+                valor_final=str(getattr(e, "valor", "")),
+                justificativa=just or f"encaixou o dado '{getattr(e, 'chave_origem', '?')}' neste campo",
+                origem_encaixe="qwen"))
+
+        # ---------- Camada 2: matching heurístico p/ campos restantes ----------
         chaves = [d.chave_original for d in dados]
-        for campo in campos:
+        for i_c, campo in enumerate(campos):
+            if i_c in cobertos:
+                continue
             melhor_i, melhor_s = -1, 0.0
             for i, chave in enumerate(chaves):
                 s = self.sim.similaridade(campo.rotulo, chave)
@@ -223,16 +289,44 @@ class MapeadorSemanticos:
                     melhor_i, melhor_s = i, s
             if melhor_i >= 0 and melhor_s >= self.limiar:
                 d = dados[melhor_i]
-                mapas.append(MapeamentoCampo(campo, d, melhor_s,
-                                             StatusCampo.OK, d.valor))
+                mapas.append(MapeamentoCampo(
+                    campo, d, melhor_s, StatusCampo.OK, d.valor,
+                    justificativa=(f"similaridade {melhor_s:.0%} entre o rótulo "
+                                  f"'{campo.rotulo}' e a chave '{d.chave_original}'"),
+                    origem_encaixe="heuristica"))
             elif melhor_i >= 0:
                 d = dados[melhor_i]
-                mapas.append(MapeamentoCampo(campo, d, melhor_s,
-                                             StatusCampo.REVISAO, d.valor))
+                mapas.append(MapeamentoCampo(
+                    campo, d, melhor_s, StatusCampo.REVISAO, d.valor,
+                    justificativa=(f"melhor candidato '{d.chave_original}' atingiu apenas "
+                                   f"{melhor_s:.0%} (< {self.limiar:.0%}) — revisar"),
+                    origem_encaixe="heuristica"))
             else:
-                mapas.append(MapeamentoCampo(campo, None, 0.0,
-                                             StatusCampo.SEM_DADO, ""))
+                mapas.append(MapeamentoCampo(
+                    campo, None, 0.0, StatusCampo.SEM_DADO, "",
+                    justificativa="nenhum dado da origem parece corresponder a este campo",
+                    origem_encaixe="heuristica"))
         return mapas
+
+    def _casar_rotulo(self, rotulo_ia: str, campos: list[CampoDestino]) -> Optional[int]:
+        """
+        Localiza o índice do campo do formulário cujo rótulo corresponde ao
+        `rotulo_destino` devolvido pelo Qwen. Tenta igualdade normalizada e,
+        em seguida, fuzzy acima do limiar (a IA costuma citar o rótulo exato,
+        mas pode parafrasear).
+        """
+        if not rotulo_ia:
+            return None
+        alvo = _normalizar(rotulo_ia)
+        for i, c in enumerate(campos):
+            if _normalizar(c.rotulo) == alvo:
+                return i
+        melhor_i, melhor_s = None, 0.0
+        for i, c in enumerate(campos):
+            s = self.sim.similaridade(rotulo_ia, c.rotulo)
+            if s > melhor_s:
+                melhor_i, melhor_s = i, s
+        return melhor_i if melhor_s >= self.limiar else None
 
     def melhor_candidatos(self, campo: CampoDestino, dados: list[DadoExtraido],
                           n: int = 5) -> list[tuple[DadoExtraido, float]]:

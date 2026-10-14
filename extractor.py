@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field, asdict
@@ -70,7 +71,32 @@ class Fonte(str, Enum):
     ESPACIAL_COLUNAS = "espacial (colunas)"
     TEXTO_LINHAS = "heurística linhas consecutivas"
     IA_LOCAL = "simulação de IA local"
+    IA_QWEN = "IA Qwen (encaixe no formulário)"
     TXT_PONTO = "txt (rótulo: valor)"
+
+
+@dataclass
+class EncaixeQwen:
+    """
+    Decisão de ENCAIXE produzida pelo Qwen: onde um dado do documento deve
+    ser colocado em qual campo do formulário de destino.
+
+    Attributes:
+        rotulo_destino: Nome do campo do formulário (exato, como enviado).
+        chave_origem: Rótulo/fragmento do PDF que contém o dado.
+        valor: Conteúdo a gravar no campo (já adaptado ao formato do alvo).
+        justificativa: Explicação curta da IA (aparece na GUI).
+        confianca: 0..1 atribuído pelo modelo.
+    """
+    rotulo_destino: str
+    chave_origem: str
+    valor: str
+    justificativa: str = ""
+    confianca: float = 0.70
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialização JSON-friendly."""
+        return asdict(self)
 
 
 @dataclass
@@ -107,6 +133,10 @@ class ResultadoExtracao:
     dados: list[DadoExtraido] = field(default_factory=list)
     texto_bruto: str = ""
     avisos: list[str] = field(default_factory=list)
+    # Decisões de encaixe do Qwen (campo do formulário -> valor do PDF).
+    # Preenchido apenas quando um backend de IA real está configurado e
+    # `rotulos_destino` foi informado ao extrator.
+    encaixes_qwen: list[EncaixeQwen] = field(default_factory=list)
 
     @property
     def como_dic(self) -> dict[str, str]:
@@ -157,15 +187,32 @@ class ExtratorPDF:
     Extrator "total" para arquivos PDF usando pdfplumber.
 
     Combina `extract_tables()`, análise espacial de palavras e fallbacks
-    textuais; se nada produzir resultado suficiente, aciona `extrair_com_ia`.
+    textuais; se nada produzir resultado suficiente, aciona a IA (Qwen).
+
+    IMPORTANTE — modo "IA sempre ativa": quando um backend de IA está
+    configurado (`ConfigIAQwen.carregar()`), o Qwen passa a ser chamado em
+    TODAS as extrações, não apenas como fallback. Ele lê o texto bruto do
+    PDF E a lista de rótulos dos campos do formulário de destino, decidindo
+    onde cada informação do documento deve ser encaixada/adaptada.
     """
 
-    def __init__(self, senha: Optional[str] = None) -> None:
+    def __init__(self, senha: Optional[str] = None,
+                 usar_ia: bool = True,
+                 rotulos_destino: Optional[list[str]] = None) -> None:
         """
         Args:
             senha: Senha opcional para PDFs criptografados.
+            usar_ia: Se True (padrão), consulta o LLM configurado (Qwen via
+                Ollama / OpenAI-compatível / API Groq-OpenRouter). Sem
+                configuração, cai na heurística determinística local.
+            rotulos_destino: Rótulos dos campos do formulário de destino.
+                Quando presentes, são enviados ao Qwen no prompt de
+                ENCAIXE para que a IA já devolva os pares prontos para o
+                formulário (com justificativa e confiança).
         """
         self.senha = senha
+        self.usar_ia = usar_ia
+        self.rotulos_destino = list(rotulos_destino or [])
 
     def extrair(self, caminho: str | Path) -> ResultadoExtracao:
         """
@@ -216,11 +263,38 @@ class ExtratorPDF:
         # Deduplicação: mantém a versão de MAIOR confiança para cada par chave+valor
         resultado.dados = self._deduplicar(resultado.dados)
 
-        # --- Estratégia 4: se as estruturas falharam, aciona a IA local ---
-        if len(resultado.dados) < 3 and resultado.texto_bruto.strip():
-            ia = extrair_com_ia(resultado.texto_bruto)
-            if ia:
-                resultado.avisos.append("Extração estruturada insuficiente; IA local acionada.")
+        # --- Estratégia 4: IA (Qwen) — SEMPRE ativa quando configurada ---
+        # Com backend de IA real configurado, o Qwen analisa o PDF em todas as
+        # extrações e decide onde cada informação se encaixa no formulário.
+        # Sem configuração, a heurística simulada só roda como fallback.
+        ia_sempre = self.usar_ia and bool(ConfigIAQwen.carregar())
+        if self.usar_ia and resultado.texto_bruto.strip():
+            # `encaixes` recebe as decisões do Qwen quando há formulário alvo;
+            # None significa "backend indisponível/não configurado".
+            encaixes: Optional[list[EncaixeQwen]] = None
+            if ia_sempre and self.rotulos_destino:
+                encaixes = consultar_qwen_encaixe(resultado.texto_bruto,
+                                                  self.rotulos_destino)
+            estrutural_fraca = len(resultado.dados) < 3
+            if encaixes is not None or estrutural_fraca:
+                if encaixes is not None:
+                    # Qwen respondeu: os pares já vêm com a chave nomeada igual ao
+                    # rótulo do formulário => o mapeamento semântico converge ~100%.
+                    resultado.encaixes_qwen = encaixes
+                    ia = [DadoExtraido(e.rotulo_destino, e.valor, Fonte.IA_QWEN.value,
+                                       max(0.5, min(0.98, e.confianca)))
+                          for e in encaixes]
+                    resultado.avisos.append(
+                        f"Qwen analisou o PDF e propôs encaixe para {len(encaixes)} "
+                        f"campo(s) do formulário.")
+                else:
+                    ia = extrair_com_ia(resultado.texto_bruto,
+                                        rotulos_destino=self.rotulos_destino)
+                    if ia:
+                        resultado.avisos.append(
+                            "IA (Qwen) consultada sobre todo o documento."
+                            if ia_sempre else
+                            "Extração estruturada insuficiente; IA local (simulada) acionada.")
                 # A IA é a ÚLTIMA instância da cascata de confiança: ela só
                 # substitui pares cuja evidência estrutural era mais fraca que
                 # a sua (evita duplicatas e preserva o melhor candidato).
@@ -232,6 +306,10 @@ class ExtratorPDF:
                     elif novo.confianca > atual.confianca:
                         atual.chave_original, atual.valor = novo.chave_original, novo.valor
                         atual.fonte, atual.confianca = novo.fonte, novo.confianca
+            elif self.usar_ia and not ia_sempre:
+                resultado.avisos.append(
+                    "IA indisponível/não configurada — usando apenas extração "
+                    "estrutural. Configure o Qwen para análise por IA.")
 
         resultado.dados = self._deduplicar(resultado.dados)
 
@@ -381,9 +459,17 @@ class ExtratorPDF:
 class ExtratorTXT:
     """Extrator para arquivos de texto puro: suporta 'chave: valor' e linhas alternadas."""
 
-    def __init__(self, encoding: str = "utf-8") -> None:
-        """Args: encoding de leitura (padrão UTF-8, com fallback latin-1)."""
+    def __init__(self, encoding: str = "utf-8", usar_ia: bool = True,
+                 rotulos_destino: Optional[list[str]] = None) -> None:
+        """
+        Args:
+            encoding: codificação de leitura (padrão UTF-8, fallback latin-1).
+            usar_ia: consulta o Qwen quando configurado (mesma política do PDF).
+            rotulos_destino: rótulos do formulário alvo para o prompt de encaixe.
+        """
         self.encoding = encoding
+        self.usar_ia = usar_ia
+        self.rotulos_destino = list(rotulos_destino or [])
 
     def extrair(self, caminho: str | Path) -> ResultadoExtracao:
         """Lê o TXT e aplica as estratégias textuais + fallback de IA local."""
@@ -417,10 +503,29 @@ class ExtratorTXT:
             if par.chave_original.lower() not in cobertas:
                 resultado.dados.append(par)
 
-        if len(resultado.dados) < 3 and texto.strip():
-            ia = extrair_com_ia(texto)
-            if ia:
-                resultado.avisos.append("Extração textual insuficiente; IA local acionada.")
+        # --- IA (Qwen): sempre que configurada; heurística local só como fallback ---
+        ia_sempre = self.usar_ia and bool(ConfigIAQwen.carregar())
+        if self.usar_ia and texto.strip():
+            encaixes: Optional[list[EncaixeQwen]] = None
+            if ia_sempre and self.rotulos_destino:
+                encaixes = consultar_qwen_encaixe(texto, self.rotulos_destino)
+            estrutural_fraca = len(resultado.dados) < 3
+            if encaixes is not None or estrutural_fraca:
+                if encaixes is not None:
+                    resultado.encaixes_qwen = encaixes
+                    ia = [DadoExtraido(e.rotulo_destino, e.valor, Fonte.IA_QWEN.value,
+                                       max(0.5, min(0.98, e.confianca)))
+                          for e in encaixes]
+                    resultado.avisos.append(
+                        f"Qwen analisou o TXT e propôs encaixe para {len(encaixes)} "
+                        f"campo(s) do formulário.")
+                else:
+                    ia = extrair_com_ia(texto, rotulos_destino=self.rotulos_destino)
+                    if ia:
+                        resultado.avisos.append(
+                            "IA (Qwen) consultada sobre todo o documento."
+                            if ia_sempre else
+                            "Extração textual insuficiente; IA local acionada.")
                 # mesma política do PDF: a IA só substitui pares de confiança
                 # inferior (é a última instância da cascata).
                 por_chave = {d.chave_original.lower(): d for d in resultado.dados}
@@ -464,30 +569,279 @@ class ExtratorTXT:
 
 
 # ===========================================================================
-# 3) Camada de simulação de IA local
+# 3) Camada de IA — Qwen real (Ollama / OpenAI-compatível) + simulação local
 # ===========================================================================
-def extrair_com_ia(texto_bruto: str) -> list[DadoExtraido]:
+@dataclass
+class ConfigIAQwen:
     """
-    Chamada (simulada) a um LLM local para extração total.
+    Configuração do backend de IA (Qwen).
 
-    COMO FUNCIONA HOJE: implementa deterministicamente o comportamento esperado
-    de um prompt de extração — percorre as linhas, reconhece pares por sinais
-    sintáticos (dois-pontos, capitalização de rótulo, terminação) e devolve o
-    MESMO formato de saída que um modelo real retornaria em JSON.
+    Prioridade de descoberta automática (via variáveis de ambiente):
+      1. `QWEN_BASE_URL` definido  -> API OpenAI-compatível (/chat/completions)
+         com `QWEN_API_KEY` opcional e `QWEN_MODEL` (padrão "qwen2.5:7b").
+      2. Ollama local disponível   -> http://localhost:11434, modelo
+         `QWEN_MODEL` (padrão "qwen2.5:7b-instruct").
+      3. Nenhuma das anteriores    -> None => o sistema usa a heurística
+         determinística (`extrair_com_ia`) como simulação de IA.
 
-    COMO PLUGAR UM LLM REAL (Ollama/llama.cpp/HF transformers):
-        payload = {"model": "llama3", "prompt": PROMPT_EXTRACAO + texto_bruto}
-        resp = requests.post("http://localhost:11434/api/generate", json=payload)
-        dados = json.loads(resp.json()["response"])  # lista de dicts
-        return [DadoExtraido(**item) for item in dados]
+    Attributes:
+        base_url: URL raiz do servidor (sem /chat/...).
+        api_key: token Bearer (vazio para Ollama).
+        modelo: nome do modelo Qwen servido.
+        estilo: "ollama" (endpoint /api/generate) ou "openai" (/v1/chat/completions).
+        timeout: segundos de espera máxima por chamada.
+    """
+    base_url: str
+    api_key: str
+    modelo: str
+    estilo: str = "openai"
+    timeout: float = 120.0
+
+    @classmethod
+    def carregar(cls) -> Optional["ConfigIAQwen"]:
+        """
+        Monta a configuração a partir do ambiente; retorna None se não houver
+        backend de IA real configurado/acessível.
+
+        A detecção do Ollama é feita uma única vez por processo (cache) para
+        não pagar latência de rede em toda extração.
+        """
+        global _CFG_CACHE, _CFG_RESOLVIDO
+        if _CFG_RESOLVIDO:
+            return _CFG_CACHE
+
+        modelo = os.environ.get("QWEN_MODEL", "")
+        base = os.environ.get("QWEN_BASE_URL", "").rstrip("/")
+        key = os.environ.get("QWEN_API_KEY", "")
+        if base:
+            estilo = "ollama" if "11434" in base else "openai"
+            _CFG_CACHE = cls(base_url=base, api_key=key,
+                             modelo=modelo or "qwen2.5:7b", estilo=estilo)
+        elif not modelo and os.environ.get("AUTODOC_IA_OFF", "") == "1":
+            _CFG_CACHE = None  # opt-out explícito de rede
+        else:
+            _CFG_CACHE = cls._detectar_ollama(modelo or "qwen2.5:7b-instruct")
+        _CFG_RESOLVIDO = True
+        return _CFG_CACHE
+
+    @staticmethod
+    def _detectar_ollama(modelo: str) -> Optional["ConfigIAQwen"]:
+        """Verifica rapidamente se há um Ollama local respondendo."""
+        url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+        try:
+            import requests
+            r = requests.get(f"{url}/api/tags", timeout=1.5)
+            if r.ok:
+                nomes = [m.get("name", "") for m in r.json().get("models", [])]
+                # escolhe o modelo pedido, ou qualquer qwen disponível
+                escolhido = modelo if any(n.startswith(modelo) for n in nomes) else next(
+                    (n for n in nomes if "qwen" in n.lower()), modelo)
+                logger.info("Ollama detectado em %s (modelo=%s)", url, escolhido)
+                return ConfigIAQwen(base_url=url, api_key="", modelo=escolhido,
+                                    estilo="ollama")
+        except Exception as exc:  # noqa: BLE001 - rede é falível por natureza
+            logger.debug("Ollama indisponível: %s", exc)
+        return None
+
+
+_CFG_CACHE: Optional[ConfigIAQwen] = None
+_CFG_RESOLVIDO: bool = False
+
+
+def reset_cache_ia() -> None:
+    """Invalida o cache de configuração de IA (usado em testes/reconfiguração)."""
+    global _CFG_RESOLVIDO
+    _CFG_RESOLVIDO = False
+
+
+def _chamar_qwen(prompt: str, cfg: ConfigIAQwen) -> str:
+    """
+    Envia o prompt ao Qwen e devolve o texto cru da resposta.
+
+    Suporta dois protocolos:
+      * Ollama: POST {base}/api/generate {"model","prompt","stream":false}
+      * OpenAI-compatível (vLLM, LM Studio, Groq, OpenRouter...):
+        POST {base}/v1/chat/completions com mensagens user/assistant.
+    Usa `requests` quando disponível; senão, `urllib` (stdlib) como fallback.
+    """
+    payload: dict[str, Any]
+    if cfg.estilo == "ollama":
+        url = f"{cfg.base_url}/api/generate"
+        payload = {"model": cfg.modelo, "prompt": prompt, "stream": False}
+    else:
+        url = f"{cfg.base_url}/v1/chat/completions"
+        payload = {
+            "model": cfg.modelo,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+        }
+    headers = {"Content-Type": "application/json"}
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    try:
+        import requests  # type: ignore
+        resp = requests.post(url, json=payload, headers=headers, timeout=cfg.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+    except ImportError:  # urllib puro, sem dependências externas
+        import urllib.request
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=cfg.timeout) as fh:
+            data = json.loads(fh.read().decode())
+    except Exception as exc:  # noqa: BLE001 - fronteira de robustez de rede
+        raise RuntimeError(
+            f"Falha ao contatar o Qwen em {url} ({type(exc).__name__}: {exc}). "
+            "Verifique se o Ollama está rodando (`ollama serve`) ou se "
+            "QWEN_BASE_URL/QWEN_API_KEY estão corretos."
+        ) from exc
+
+    if cfg.estilo == "ollama":
+        return str(data.get("response", ""))
+    try:
+        return str(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError) as exc:
+        raise RuntimeError(f"Resposta do Qwen em formato inesperado: {data}") from exc
+
+
+def _extrair_json(resposta: str) -> list[Any]:
+    """
+    Extrai a primeira lista JSON válida da resposta do modelo.
+
+    LLMs costumam envolver o JSON em cercas ```json ... ``` ou texto extra;
+    esta função localiza o primeiro '[' balanceado e faz json.loads tolerante.
+    """
+    m = re.search(r"\[.*\]", resposta, flags=re.DOTALL)
+    if not m:
+        raise ValueError(f"Nenhum JSON encontrado na resposta: {resposta[:200]!r}")
+    return json.loads(m.group(0))
+
+
+PROMPT_ENCAIXE_TEMPLATE: str = """\
+Você é o motor de IA do AutoDoc. Abaixo estão (1) o CONTEÚDO EXTRAÍDO DE UM \
+DOCUMENTO (PDF/TXT) e (2) a LISTA DE CAMPOS de um formulário de destino.
+
+Sua tarefa: analisar TODAS as informações do documento e decidir ONDE cada \
+informação deve ser ENCAIXADA no formulário, adaptando o formato quando \
+necessário (ex.: datas para o padrão do campo, CPF apenas dígitos, quebrar \
+"Endereço completo" em rua/número/cidade quando existirem campos separados).
+
+REGRAS:
+- Use APENAS dados presentes no documento. NUNCA invente valores.
+- Se nenhum dado do documento corresponde a um campo, omita esse campo.
+- "confianca" vai de 0 a 1 (sua certeza sobre o encaixe).
+- Responda SOMENTE com um JSON válido, sem comentários nem cercas de código:
+[
+  {{"rotulo_destino": "<nome EXATO do campo do formulário>",
+    "chave_origem": "<rótulo/fragmento do documento que contém o dado>",
+    "valor": "<valor final já adaptado>",
+    "justificativa": "<por que este dado encaixa aqui>",
+    "confianca": 0.9}}
+]
+
+--- CAMPOS DO FORMULÁRIO ---
+{campos}
+
+--- DOCUMENTO ---
+{documento}
+"""
+
+
+def consultar_qwen_encaixe(texto_documento: str,
+                           rotulos_destino: list[str]) -> Optional[list[EncaixeQwen]]:
+    """
+    Pede ao Qwen que analise o documento e proponha o ENCAIXE dos dados nos
+    campos do formulário de destino.
+
+    Returns:
+        Lista de `EncaixeQwen` (pode ser vazia se o modelo não achar nada),
+        ou None se não houver backend configurado / a chamada falhar — nesse
+        caso o chamador mantém apenas a extração estrutural/heurística.
+    """
+    cfg = ConfigIAQwen.carregar()
+    if cfg is None:
+        return None
+    # limita o documento para caber na janela do modelo (heurística simples)
+    doc = texto_documento[:12000]
+    campos = "\n".join(f"- {r}" for r in rotulos_destino)
+    prompt = PROMPT_ENCAIXE_TEMPLATE.format(campos=campos, documento=doc)
+    try:
+        resposta = _chamar_qwen(prompt, cfg)
+        itens = _extrair_json(resposta)
+    except Exception as exc:  # noqa: BLE001 - degradação graciosa é essencial
+        logger.warning("Qwen indisponível/falhou: %s", exc)
+        return None
+    saida: list[EncaixeQwen] = []
+    for it in itens:
+        try:
+            if not isinstance(it, dict):
+                continue
+            rot = str(it.get("rotulo_destino", "")).strip()
+            val = str(it.get("valor", "")).strip()
+            if not rot or not val:
+                continue
+            conf = float(it.get("confianca", 0.7))
+            saida.append(EncaixeQwen(rotulo_destino=rot,
+                                     chave_origem=str(it.get("chave_origem", rot)).strip(),
+                                     valor=val,
+                                     justificativa=str(it.get("justificativa", "")).strip(),
+                                     confianca=max(0.0, min(1.0, conf))))
+        except (TypeError, ValueError):
+            continue  # item malformado: ignora individualmente, não aborta tudo
+    logger.info("Qwen (%s/%s) retornou %d encaixe(s).",
+                cfg.estilo, cfg.modelo, len(saida))
+    return saida
+
+
+def extrair_com_ia(texto_bruto: str,
+                   rotulos_destino: Optional[list[str]] = None) -> list[DadoExtraido]:
+    """
+    Camada de IA com duas implementações possíveis:
+
+    1) QWEN REAL (preferencial, quando configurado):
+       Detecta automaticamente Ollama local ou endpoint OpenAI-compatível via
+       variáveis de ambiente (QWEN_BASE_URL / QWEN_API_KEY / QWEN_MODEL).
+       O modelo recebe TODO o texto do documento e devolve um JSON com todos
+       os pares chave-valor encontrados (extração total, sem listas fixas).
+
+    2) SIMULAÇÃO DETERMINÍSTICA (fallback offline):
+       Percorre as linhas reconhecendo pares por sinais sintáticos
+       (dois-pontos, capitalização de rótulo, terminação) e devolve o MESMO
+       formato que o modelo real retornaria — assim os consumidores
+       (filler/GUI) funcionam igual sem GPU nem internet.
 
     Args:
         texto_bruto: conteúdo textual integral do documento.
+        rotulos_destino: rótulos do formulário alvo (contexto extra p/ o Qwen).
 
     Returns:
-        Lista de `DadoExtraido` com fonte=IA_LOCAL e confiança moderada (0.65),
-        pois saídas de modelo exigem revisão humana na GUI.
+        Lista de `DadoExtraido`; fonte=IA_QWEN quando o modelo real respondeu,
+        fonte=IA_LOCAL na simulação.
     """
+    cfg = ConfigIAQwen.carregar()
+    if cfg is not None:
+        prompt = PROMPT_EXTRACAO.format(
+            campos=("\n".join(f"- {r}" for r in (rotulos_destino or [])) or "(nenhum)"),
+            documento=texto_bruto[:12000])
+        try:
+            itens = _extrair_json(_chamar_qwen(prompt, cfg))
+            saida_q: list[DadoExtraido] = []
+            for it in itens:
+                if not isinstance(it, dict):
+                    continue
+                chave = str(it.get("chave_original", "")).strip()
+                valor = str(it.get("valor", "")).strip()
+                if chave and valor:
+                    saida_q.append(DadoExtraido(
+                        chave, valor, Fonte.IA_QWEN.value,
+                        max(0.0, min(1.0, float(it.get("confianca", 0.8)))),
+                        posicao=(0.0, 0.0)))
+            if saida_q:
+                return saida_q
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chamada ao Qwen falhou (%s); usando heurística local.", exc)
+
     dados: list[DadoExtraido] = []
     linhas = [l.strip() for l in texto_bruto.splitlines() if l.strip()]
     for idx, linha in enumerate(linhas):
@@ -509,26 +863,42 @@ def extrair_com_ia(texto_bruto: str) -> list[DadoExtraido]:
     return dados
 
 
-PROMPT_EXTRACAO: str = (
-    "Você é um motor de Document AI. Extraia TODOS os pares chave-valor deste "
-    "documento, incluindo tabelas e relações espaciais. Responda APENAS com JSON: "
-    '[{"chave_original": str, "valor": str, "fonte": "ia", "confianca": float}].\n\n---\n'
-)
+PROMPT_EXTRACAO: str = """\
+Você é um motor de Document AI. Extraia TODOS os pares chave-valor deste \
+documento, incluindo tabelas e relações espaciais. Se houver uma lista de \
+campos de formulário abaixo, priorize chaves com esses mesmos nomes.
+
+Campos do formulário (opcional):
+{campos}
+
+Responda APENAS com JSON válido, sem cercas de código:
+[{{"chave_original": str, "valor": str, "fonte": "ia", "confianca": float}}]
+
+--- DOCUMENTO ---
+{documento}
+"""
 
 
 # ===========================================================================
 # API de alto nível
 # ===========================================================================
-def extrair_documento(caminho: str | Path, senha: Optional[str] = None) -> ResultadoExtracao:
+def extrair_documento(caminho: str | Path, senha: Optional[str] = None,
+                      rotulos_destino: Optional[list[str]] = None,
+                      usar_ia: bool = True) -> ResultadoExtracao:
     """
     Ponto de entrada único: escolhe o extrator conforme a extensão do arquivo.
 
     Args:
         caminho: `.pdf` ou `.txt`.
         senha: senha opcional para PDFs criptografados.
+        rotulos_destino: rótulos dos campos do formulário alvo; quando há um
+            backend Qwen configurado, são enviados à IA para que ela decida
+            ONDE encaixar cada informação do documento.
+        usar_ia: desabilite (False) para força apenas extração estrutural.
 
     Returns:
-        `ResultadoExtracao` consolidado.
+        `ResultadoExtracao` consolidado (inclui `encaixes_qwen` quando a IA
+        real respondeu).
 
     Raises:
         ValueError: extensão não suportada.
@@ -537,9 +907,11 @@ def extrair_documento(caminho: str | Path, senha: Optional[str] = None) -> Resul
     p = Path(caminho)
     ext = p.suffix.lower()
     if ext == ".pdf":
-        return ExtratorPDF(senha=senha).extrair(p)
+        return ExtratorPDF(senha=senha, usar_ia=usar_ia,
+                           rotulos_destino=rotulos_destino).extrair(p)
     if ext == ".txt":
-        return ExtratorTXT().extrair(p)
+        return ExtratorTXT(usar_ia=usar_ia,
+                           rotulos_destino=rotulos_destino).extrair(p)
     raise ValueError(f"Formato não suportado: '{ext}'. Use .pdf ou .txt.")
 
 
