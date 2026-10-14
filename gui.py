@@ -27,7 +27,15 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Optional
 
-from extractor import DadoExtraido, ResultadoExtracao, extrair_documento
+from extractor import (
+    ConfigIAQwen,
+    DadoExtraido,
+    EncaixeQwen,
+    ResultadoExtracao,
+    consultar_qwen_encaixe,
+    extrair_documento,
+    reset_cache_ia,
+)
 from filler import (
     CampoDestino,
     MapeadorSemanticos,
@@ -65,6 +73,9 @@ class AplicacaoPreenchimento:
         self.destino_arquivo: Optional[Path] = None
         self.sim = Similarizador()
         self.mapeador = MapeadorSemanticos(self.sim)
+        # Estado da IA Qwen: configuração detectada + último resultado bruto
+        self.cfg_ia: Optional[ConfigIAQwen] = ConfigIAQwen.carregar()
+        self._encaixes_brutos: list[EncaixeQwen] = []
 
         self._estilo()
         self._topo()
@@ -116,8 +127,15 @@ class AplicacaoPreenchimento:
                    style="Primario.TButton",
                    command=lambda: self._executar_preenchimento(dry_run=False)
                    ).pack(side="left", padx=6)
+        ttk.Separator(barra, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(barra, text="🤖 IA Qwen",
+                   command=self._dialogo_ia).pack(side="left", padx=6)
         self.lbl_backend = ttk.Label(barra, text=f"Motor semântico: {self.sim.backend}",
                                      background=COR_FUNDO, foreground="#6b7280")
+        self.lbl_ia = ttk.Label(barra, text="", background=COR_FUNDO,
+                                foreground="#6b7280")
+        self.lbl_ia.pack(side="right")
+        self._atualizar_label_ia()
         self.lbl_backend.pack(side="right")
 
         self.status_var = tk.StringVar(value="")
@@ -160,8 +178,16 @@ class AplicacaoPreenchimento:
         self.tv_origem.bind("<Double-1>", self._editar_valor_origem)
 
         # ---- Painel direito: campos do DESTINO ----
+        dir_wrap = ttk.Frame(dir_)
+        dir_wrap.pack(fill="x", padx=10, pady=(0, 2))
         ttk.Label(dir_, text="DESTINO — campos do formulário e mapeamento",
                   style="Titulo.TLabel").pack(anchor="w", padx=10, pady=(10, 2))
+        self.chk_ia = tk.BooleanVar(value=True)
+        ttk.Checkbutton(dir_wrap, text="🤖 Mostrar justificativas do Qwen",
+                        variable=self.chk_ia, command=self._reatualizar_mapeamentos
+                        ).pack(side="left")
+        ttk.Button(dir_wrap, text="🧠 Reanalisar com IA",
+                   command=self.reanalisar_com_ia).pack(side="right")
         self.frame_campos = ttk.Frame(dir_)
         canvas = tk.Canvas(dir_, highlightthickness=0, bg=COR_PAINEL)
         scroll_d = ttk.Scrollbar(dir_, orient="vertical", command=canvas.yview)
@@ -186,7 +212,10 @@ class AplicacaoPreenchimento:
             return
         senha: Optional[str] = None
         try:
-            res = extrair_documento(caminho, senha=senha)
+            # Os rótulos do destino (se já carregado) vão para a IA decidir o
+            # encaixe de cada informação do documento diretamente no formulário.
+            rotulos = [c.rotulo for c in self.campos_destino] or None
+            res = extrair_documento(caminho, senha=senha, rotulos_destino=rotulos)
         except PermissionError:
             senha = simpledialog_get_password(self.root, "PDF protegido",
                                               "Digite a senha do PDF:")
@@ -194,7 +223,7 @@ class AplicacaoPreenchimento:
                 messagebox.showerror("Erro", "PDF exige senha.")
                 return
             try:
-                res = extrair_documento(caminho, senha=senha)
+                res = extrair_documento(caminho, senha=senha, rotulos_destino=rotulos)
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("Erro", f"Falha ao ler PDF: {exc}")
                 return
@@ -203,6 +232,7 @@ class AplicacaoPreenchimento:
             return
 
         self.resultado = res
+        self._encaixes_brutos = list(res.encaixes_qwen)
         self._renderir_origem(res)
         aviso = ("  ⚠ " + "; ".join(res.avisos)) if res.avisos else ""
         self._set_status(f"{len(res.dados)} pares extraídos de {Path(caminho).name}.{aviso}")
@@ -290,7 +320,8 @@ class AplicacaoPreenchimento:
                 por_chave[chave].confianca = min(1.0, por_chave[chave].confianca)
 
     def _reatualizar_mapeamentos(self) -> None:
-        """Roda o mapeador semântico e redesenha o painel direito."""
+        """Roda o mapeador (Qwen em 1º lugar, heurística como fallback) e
+        redesenha o painel direito."""
         self._sincronizar_valores_ui()
         for w in self.frame_campos.winfo_children():
             w.destroy()
@@ -301,7 +332,10 @@ class AplicacaoPreenchimento:
                       foreground="#6b7280").pack(padx=12, pady=20)
             return
         dados = self.resultado.dados if self.resultado else []
-        self.mapas = self.mapeador.mapear(self.campos_destino, dados)
+        # Camada 1 = encaixes propostos pelo Qwen (se houver); camada 2 =
+        # similaridade heurística apenas para os campos que a IA não cobriu.
+        self.mapas = self.mapeador.mapear(self.campos_destino, dados,
+                                          encaixes_ia=self._encaixes_brutos)
         for m in self.mapas:
             self._linha_campo(m, dados)
 
@@ -310,12 +344,17 @@ class AplicacaoPreenchimento:
         frame = ttk.Frame(self.frame_campos)
         frame.pack(fill="x", padx=10, pady=6)
 
-        cor = COR_OK if m.status == StatusCampo.OK else (
-            COR_WARN if m.status == StatusCampo.REVISAO else "#6b7280")
-        tag = " ✔" if m.status == StatusCampo.OK else (
+        cor = COR_OK if m.status in (StatusCampo.OK, StatusCampo.PREENCHIDO) else (
+            COR_WARN if m.status in (StatusCampo.REVISAO, StatusCampo.FALHA) else "#6b7280")
+        tag = " ✔" if m.status in (StatusCampo.OK, StatusCampo.PREENCHIDO) else (
             " ⚠ revisão" if m.status == StatusCampo.REVISAO else " ✖ sem dado")
-        ttk.Label(frame, text=m.campo.rotulo + tag, foreground=cor,
-                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        origem = {"qwen": "🤖 Qwen", "manual": "✋ manual"}.get(m.origem_encaixe, "🔎 heurística")
+        cab = ttk.Frame(frame)
+        cab.grid(row=0, column=0, sticky="w")
+        ttk.Label(cab, text=m.campo.rotulo + tag, foreground=cor,
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Label(cab, text=f"  [{origem}]", foreground="#6b7280",
+                  font=("Segoe UI", 8, "italic")).pack(side="left")
         ttk.Label(frame, text=f"confiança: {m.score:.0%}", foreground=cor
                   ).grid(row=0, column=2, sticky="e", padx=(8, 0))
 
@@ -326,8 +365,8 @@ class AplicacaoPreenchimento:
 
         pb = ttk.Progressbar(frame, length=120, mode="determinate",
                              value=int(m.score * 100))
-        estilo_pb = ("Verde" if m.status == StatusCampo.OK else
-                     "Laranja" if m.status == StatusCampo.REVISAO else "Cinza")
+        estilo_pb = ("Verde" if m.status in (StatusCampo.OK, StatusCampo.PREENCHIDO) else
+                     "Laranja" if m.status in (StatusCampo.REVISAO, StatusCampo.FALHA) else "Cinza")
         pb.configure(style=f"{estilo_pb}.Horizontal.TProgressbar")
         pb.grid(row=2, column=0, sticky="w", pady=(0, 4))
 
@@ -339,6 +378,13 @@ class AplicacaoPreenchimento:
         combo.bind("<<ComboboxSelected>>",
                    lambda e, mm=m, cc=cbv, vv=var: self._remapear_manual(mm, cc.get(), vv))
         frame.columnconfigure(0, weight=1)
+
+        # Justificativa do encaixe (Qwen ou heurística) — linha auxiliar cinza
+        if m.justificativa and self.chk_ia.get():
+            prefixo = "🤖 Qwen: " if m.origem_encaixe == "qwen" else "ℹ "
+            ttk.Label(frame, text=prefixo + m.justificativa, foreground="#6b7280",
+                      font=("Segoe UI", 8, "italic"), wraplength=520, justify="left"
+                      ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
     # ------------------------------------------------------------- interações
     def _editar_valor_origem(self, event: Any) -> None:
@@ -373,10 +419,159 @@ class AplicacaoPreenchimento:
         """Usuário corrigiu manualmente o valor previsto de um campo destino."""
         if novo != m.valor_final:
             m.valor_final = novo
+            m.origem_encaixe = "manual"
             if m.status in (StatusCampo.REVISAO, StatusCampo.SEM_DADO) and novo:
                 m.status = StatusCampo.OK
                 m.score = max(m.score, 0.80)
+            m.justificativa = f"valor corrigido manualmente para '{novo[:60]}'"
             self._reatualizar_mapeamentos()
+
+    # ----------------------------------------------------- IA Qwen: análise/reconfig
+    def reanalisar_com_ia(self) -> None:
+        """
+        Reexecuta o ENCAIXE do Qwen sob demanda (botão '🧠 Reanalisar com IA').
+
+        Útil quando o destino foi carregado DEPOIS da origem, ou quando o
+        usuário corrigiu valores na tabela e quer nova opinião da IA. Roda em
+        thread para não congelar a UI; ao voltar, injeta os encaixes como
+        camada preferencial do mapeamento.
+        """
+        if not self.resultado or not self.campos_destino:
+            messagebox.showwarning(
+                "Reanálise", "Carregue a ORIGEM e o DESTINO antes de usar a IA.")
+            return
+        if not ConfigIAQwen.carregar():
+            self._dialogo_ia()
+            if not ConfigIAQwen.carregar():
+                messagebox.showinfo(
+                    "IA indisponível",
+                    "Nenhum backend Qwen configurado/acessível.\n"
+                    "O sistema seguirá apenas com o mapeamento heurístico.")
+                return
+        texto = self.resultado.texto_bruto
+        rotulos = [c.rotulo for c in self.campos_destino]
+        self._set_status("🤖 Qwen analisando o documento e propondo encaixes ...")
+        threading.Thread(target=self._reanalise_bg, args=(texto, rotulos),
+                         daemon=True).start()
+
+    def _reanalise_bg(self, texto: str, rotulos: list[str]) -> None:
+        """Thread: consulta o Qwen sem bloquear a interface."""
+        try:
+            encaixes = consultar_qwen_encaixe(texto, rotulos)
+            self.root.after(0, self._on_reanalise, encaixes, None)
+        except Exception as exc:  # noqa: BLE001 - fronteira de robustez
+            self.root.after(0, self._on_reanalise, None, exc)
+
+    def _on_reanalise(self, encaixes: Optional[list[EncaixeQwen]],
+                      erro: Optional[Exception]) -> None:
+        """Callback main-thread: aplica os encaixes propostos pelo Qwen."""
+        if erro:
+            messagebox.showerror("Falha na IA", str(erro))
+            self._set_status("Reanálise com IA falhou.")
+            return
+        if not encaixes:
+            self._set_status("Qwen não retornou encaixes (resposta vazia ou "
+                             "modelo fora do ar); mantendo mapeamento atual.")
+            return
+        self._encaixes_brutos = encaixes
+        qwen_ok = sum(1 for e in encaixes if e.confianca >= 0.75)
+        self._set_status(f"🤖 Qwen propôs {len(encaixes)} encaixe(s) "
+                         f"({qwen_ok} com confiança ≥ 75%). Revisão recomendada "
+                         "antes de executar.")
+        self._reatualizar_mapeamentos()
+
+    def _dialogo_ia(self) -> None:
+        """
+        Janela de configuração do backend Qwen.
+
+        Permite apontar para Ollama local ou qualquer API OpenAI-compatível
+        (vLLM, LM Studio, Groq, OpenRouter...) sem editar variáveis de
+        ambiente. Ao salvar, grava QWEN_BASE_URL/QWEN_MODEL/QWEN_API_KEY no
+        processo, limpa o cache de detecção e faz um teste de conectividade.
+        """
+        win = tk.Toplevel(self.root)
+        win.title("🤖 IA Qwen — configuração do backend")
+        win.configure(bg=COR_PAINEL)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text="Backend de IA (Qwen)", style="Titulo.TLabel"
+                  ).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 4))
+        ttk.Label(win, text="Base URL  (ex.: http://localhost:11434 ou https://api.../v1):",
+                  background=COR_PAINEL).grid(row=1, column=0, sticky="w", padx=14, pady=4)
+        ent_url = ttk.Entry(win, width=46)
+        ent_url.grid(row=1, column=1, sticky="we", padx=(0, 14), pady=4)
+        ttk.Label(win, text="Modelo  (ex.: qwen2.5:7b-instruct):",
+                  background=COR_PAINEL).grid(row=2, column=0, sticky="w", padx=14, pady=4)
+        ent_modelo = ttk.Entry(win, width=46)
+        ent_modelo.grid(row=2, column=1, sticky="we", padx=(0, 14), pady=4)
+        ttk.Label(win, text="API Key  (opcional / vazio p/ Ollama):",
+                  background=COR_PAINEL).grid(row=3, column=0, sticky="w", padx=14, pady=4)
+        ent_key = ttk.Entry(win, width=46, show="*")
+        ent_key.grid(row=3, column=1, sticky="we", padx=(0, 14), pady=4)
+
+        # Pré-preenche com a configuração já detectada (se houver)
+        cfg = ConfigIAQwen.carregar()
+        if cfg:
+            ent_url.insert(0, cfg.base_url)
+            ent_modelo.insert(0, cfg.modelo)
+            ent_key.insert(0, cfg.api_key)
+
+        lbl_res = ttk.Label(win, text="", background=COR_PAINEL, wraplength=520,
+                            foreground="#374151", justify="left")
+        lbl_res.grid(row=4, column=0, columnspan=2, sticky="we", padx=14, pady=6)
+
+        def salvar() -> None:
+            """Aplica a configuração ao ambiente do processo e testa a conexão."""
+            import os as _os
+            url = ent_url.get().strip().rstrip("/")
+            modelo = ent_modelo.get().strip()
+            key = ent_key.get().strip()
+            if not url:
+                _os.environ.pop("QWEN_BASE_URL", None)
+                _os.environ["AUTODOC_IA_OFF"] = "1"
+                lbl_res.config(text="IA desativada — usando heurística local.",
+                               foreground=COR_WARN)
+            else:
+                _os.environ.pop("AUTODOC_IA_OFF", None)
+                _os.environ["QWEN_BASE_URL"] = url
+                if modelo:
+                    _os.environ["QWEN_MODEL"] = modelo
+                if key:
+                    _os.environ["QWEN_API_KEY"] = key
+                reset_cache_ia()
+                new_cfg = ConfigIAQwen.carregar()
+                if new_cfg is None:
+                    lbl_res.config(text=f"⚠ Não foi possível contatar {url}. "
+                                       "Verifique se o servidor está ativo.",
+                                   foreground=COR_ERRO)
+                else:
+                    lbl_res.config(
+                        text=f"✔ Backend salvo: {new_cfg.estilo} @ {new_cfg.base_url} "
+                             f"(modelo {new_cfg.modelo}). Clique em '🧠 Reanalisar com IA'.",
+                        foreground=COR_OK)
+            self.cfg_ia = ConfigIAQwen.carregar()
+            self._atualizar_label_ia()
+
+        botoes = ttk.Frame(win)
+        botoes.grid(row=5, column=0, columnspan=2, sticky="ew", padx=14, pady=(4, 12))
+        ttk.Button(botoes, text="💾 Salvar e testar", style="Primario.TButton",
+                   command=salvar).pack(side="right", padx=(6, 0))
+        ttk.Button(botoes, text="Fechar", command=win.destroy).pack(side="right")
+        win.columnconfigure(1, weight=1)
+
+    def _atualizar_label_ia(self) -> None:
+        """Mostra no topo o estado real do backend Qwen."""
+        cfg = self.cfg_ia
+        if cfg:
+            self.lbl_ia.config(
+                text=f"🤖 Qwen: {cfg.modelo} @ {cfg.base_url} ({cfg.estilo})",
+                foreground=COR_OK)
+        else:
+            self.lbl_ia.config(
+                text="🤖 Qwen: não configurado (heurística local + fuzzy)",
+                foreground=COR_WARN)
 
     def _remapear_manual(self, m: MapeamentoCampo, chave: str,
                          var_valor: tk.StringVar) -> None:
@@ -386,12 +581,15 @@ class AplicacaoPreenchimento:
         if chave == "— nenhum —":
             m.dado, m.valor_final, m.score = None, "", 0.0
             m.status = StatusCampo.SEM_DADO
+            m.justificativa = "limpo manualmente pelo usuário"
         else:
             d = next((x for x in self.resultado.dados
                       if x.chave_original == chave), None)
             if d:
                 m.dado, m.valor_final, m.score = d, d.valor, 1.0
                 m.status = StatusCampo.OK
+                m.justificativa = f"atribuído manualmente a '{d.chave_original}'"
+        m.origem_encaixe = "manual"
         var_valor.set(m.valor_final)
         self._reatualizar_mapeamentos()
 

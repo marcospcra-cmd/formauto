@@ -20,6 +20,36 @@ python gui.py                      # interface gráfica
 python extractor.py documento.pdf [senha]
 ```
 
+## 🤖 IA Qwen — análise do documento e encaixe no formulário
+O sistema usa o **Qwen** para ler TODO o conteúdo do PDF/TXT e decidir **onde
+cada informação se encaixa** no formulário de destino, adaptando formatos
+(data, CPF, endereço quebrado em rua/número/cidade) e devolvendo uma
+**justificativa** por decisão.
+
+Configuração (qualquer uma funciona; a GUI também tem o botão **🤖 IA Qwen**):
+```bash
+# 1) Ollama local (recomendado, offline)
+ollama serve && ollama pull qwen2.5:7b-instruct
+python gui.py                       # detecta http://localhost:11434 sozinho
+
+# 2) API OpenAI-compatível (vLLM, LM Studio, Groq, OpenRouter...)
+export QWEN_BASE_URL="https://seu-endpoint/v1"
+export QWEN_API_KEY="sua-chave"
+export QWEN_MODEL="qwen2.5-7b-instruct"
+```
+Como funciona o fluxo:
+1. `extractor.extrair_documento(..., rotulos_destino=[...])` envia o texto do
+   documento + a lista de campos do formulário ao Qwen (`consultar_qwen_encaixe`).
+2. O modelo responde um JSON `[{"rotulo_destino", "chave_origem", "valor",
+   "justificativa", "confianca"}]` → `ResultadoExtracao.encaixes_qwen`.
+3. `filler.MapeadorSemanticos.mapear(campos, dados, encaixes_ia)` aplica em
+   **duas camadas**: encaixes do Qwen primeiro (com confiança/justificativa da
+   IA); os campos que a IA não cobriu caem na heurística fuzzy/neural.
+4. Na GUI, cada linha do painel direito mostra a tag `[🤖 Qwen]`,
+   `[🔎 heurística]` ou `[✋ manual]` + a justificativa; use **🧠 Reanalisar
+   com IA** após carregar/editar, e o dropdown para corrigir qualquer erro.
+Sem backend configurado, tudo continua funcionando via heurística determinística.
+
 ## Observações técnicas
 * PDFs protegidos por senha levantam `PermissionError`; a GUI pede a senha.
 * Sites fora do ar levantam `ConnectionError` tratado na GUI.
