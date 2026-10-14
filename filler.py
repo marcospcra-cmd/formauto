@@ -221,7 +221,8 @@ class MapeadorSemanticos:
         """
         Estratégia de encaixe em DUAS CAMADAS:
 
-        1. IA QWEN (camada preferencial): cada `EncaixeQwen` retornado por
+        1. IA QWEN via navegador do usuário, sem API (camada preferencial): cada
+           `EncaixeQwen` retornado por
            `consultar_qwen_encaixe()` já traz o par
            (rotulo_destino -> valor adaptado + justificativa). O rótulo é
            casado com os campos do destino (exact-after-normalization e, se
