@@ -1,0 +1,487 @@
+"""
+gui.py — Interface gráfica de controle, revisão e mapeamento (Tkinter/ttk).
+================================================================================
+
+Layout em duas colunas sobre Notebook:
+  * ABA "Revisão & Mapeamento":
+      - PAINEL ESQUERDO (Origem): Treeview editável com TODOS os dados
+        extraídos (chave, valor editável, fonte, confiança, página).
+        Duplo-clique na coluna "Valor" abre edição inline.
+      - PAINEL DIREITO (Destino): para cada campo do formulário alvo mostra
+        o valor mapeado, uma barra de confiança (ttk.Progressbar) e um
+        Combobox para reatribuir manualmente qualquer dado da origem.
+  * BARRA SUPERIOR: Carregar Origem / Carregar Destino / Simular (Dry-run) /
+    Executar Preenchimento + status geral.
+
+Executores longos (Playwright/IA) rodam em threads separadas para nunca
+congelar a UI; resultados voltam via `root.after` (thread-safe).
+Execute:  python gui.py
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Any, Optional
+
+from extractor import DadoExtraido, ResultadoExtracao, extrair_documento
+from filler import (
+    CampoDestino,
+    MapeadorSemanticos,
+    MapeamentoCampo,
+    PreenchedorPDF,
+    PreenchedorTXT,
+    PreenchedorWeb,
+    Similarizador,
+    StatusCampo,
+)
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logger = logging.getLogger("gui")
+
+# Paleta "moderna" sóbria
+COR_FUNDO = "#f4f5f7"
+COR_PAINEL = "#ffffff"
+COR_ACENTO = "#2f6fed"
+COR_OK = "#1a7f37"
+COR_WARN = "#b45309"
+COR_ERRO = "#b91c1c"
+
+
+class AplicacaoPreenchimento:
+    """Classe-mestre que une extractor + filler + widgets Tk."""
+
+    def __init__(self, root: tk.Tk) -> None:
+        """Constrói a janela e inicializa o estado de negócio."""
+        self.root = root
+        self.resultado: Optional[ResultadoExtracao] = None
+        self.campos_destino: list[CampoDestino] = []
+        self.mapas: list[MapeamentoCampo] = []
+        self.destino_url: Optional[str] = None
+        self.destino_arquivo: Optional[Path] = None
+        self.sim = Similarizador()
+        self.mapeador = MapeadorSemanticos(self.sim)
+
+        self._estilo()
+        self._topo()
+        self._corpo()
+        self._set_status("Pronto. Carregue um documento de origem (.pdf/.txt).")
+
+    # ------------------------------------------------------------------ estilo
+    def _estilo(self) -> None:
+        """Configura ttk 'clam' com paleta limpa e fontes legíveis."""
+        self.root.title("AutoDoc AI — Extração Inteligente e Preenchimento Automático")
+        self.root.geometry("1280x760")
+        self.root.minsize(1000, 620)
+        self.root.configure(bg=COR_FUNDO)
+        st = ttk.Style(self.root)
+        st.theme_use("clam")
+        st.configure(".", background=COR_FUNDO, font=("Segoe UI", 10))
+        st.configure("TNotebook", background=COR_FUNDO, borderwidth=0)
+        st.configure("TNotebook.Tab", padding=(14, 8), font=("Segoe UI", 10, "bold"))
+        st.configure("Card.TFrame", background=COR_PAINEL, relief="flat")
+        st.configure("TLabel", background=COR_PAINEL)
+        st.configure("Titulo.TLabel", background=COR_PAINEL,
+                     font=("Segoe UI", 11, "bold"), foreground="#111827")
+        st.configure("TButton", padding=(10, 6), font=("Segoe UI", 10, "bold"))
+        st.configure("Primario.TButton", foreground="white", background=COR_ACENTO)
+        st.map("Primario.TButton", background=[("active", "#1e56d1")])
+        st.configure("Treeview", rowheight=26, fieldbackground=COR_PAINEL,
+                     background=COR_PAINEL)
+        st.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        st.configure("Verde.Horizontal.TProgressbar", troughcolor="#e5e7eb",
+                     background=COR_OK)
+        st.configure("Laranja.Horizontal.TProgressbar", troughcolor="#e5e7eb",
+                     background="#d97706")
+        st.configure("Cinza.Horizontal.TProgressbar", troughcolor="#e5e7eb",
+                     background="#9ca3af")
+
+    # -------------------------------------------------------------------- topo
+    def _topo(self) -> None:
+        """Barra superior com os 4 botões de ação exigidos + status."""
+        barra = ttk.Frame(self.root, style=None)
+        barra.pack(fill="x", padx=12, pady=(10, 4))
+        ttk.Button(barra, text="📄 Carregar Origem",
+                   command=self.carregar_origem).pack(side="left", padx=(0, 6))
+        ttk.Button(barra, text="🎯 Carregar Destino",
+                   command=self.carregar_destino).pack(side="left", padx=6)
+        ttk.Button(barra, text="🧪 Simular Preenchimento (Dry-run)",
+                   command=lambda: self._executar_preenchimento(dry_run=True)
+                   ).pack(side="left", padx=6)
+        ttk.Button(barra, text="🚀 Executar Preenchimento",
+                   style="Primario.TButton",
+                   command=lambda: self._executar_preenchimento(dry_run=False)
+                   ).pack(side="left", padx=6)
+        self.lbl_backend = ttk.Label(barra, text=f"Motor semântico: {self.sim.backend}",
+                                     background=COR_FUNDO, foreground="#6b7280")
+        self.lbl_backend.pack(side="right")
+
+        self.status_var = tk.StringVar(value="")
+        self.lbl_status = ttk.Label(self.root, textvariable=self.status_var,
+                                    background=COR_FUNDO, anchor="w",
+                                    font=("Segoe UI", 9, "italic"))
+        self.lbl_status.pack(fill="x", padx=14, pady=(0, 4))
+
+    # ------------------------------------------------------------------- corpo
+    def _corpo(self) -> None:
+        """Notebook com a aba principal de dois painéis."""
+        self.note = ttk.Notebook(self.root)
+        self.note.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        aba = ttk.Frame(self.note)
+        self.note.add(aba, text="  Revisão & Mapeamento  ")
+
+        paned = ttk.Panedwindow(aba, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=6, pady=6)
+
+        esq = ttk.Frame(paned, style="Card.TFrame")
+        dir_ = ttk.Frame(paned, style="Card.TFrame")
+        paned.add(esq, weight=1)
+        paned.add(dir_, weight=1)
+
+        # ---- Painel esquerdo: tabela editável da ORIGEM ----
+        ttk.Label(esq, text="ORIGEM — dados extraídos (duplo-clique no valor p/ editar)",
+                  style="Titulo.TLabel").pack(anchor="w", padx=10, pady=(10, 2))
+        cols = ("chave", "valor", "fonte", "conf", "pag")
+        self.tv_origem = ttk.Treeview(esq, columns=cols, show="headings", height=18)
+        larguras = {"chave": 170, "valor": 260, "fonte": 150, "conf": 60, "pag": 45}
+        titulos = {"chave": "Chave", "valor": "Valor", "fonte": "Fonte",
+                   "conf": "Conf.", "pag": "Pág"}
+        for c in cols:
+            self.tv_origem.heading(c, text=titulos[c])
+            self.tv_origem.column(c, width=larguras[c], anchor="w")
+        scroll_o = ttk.Scrollbar(esq, orient="vertical", command=self.tv_origem.yview)
+        self.tv_origem.configure(yscrollcommand=scroll_o.set)
+        self.tv_origem.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        scroll_o.pack(side="right", fill="y", pady=10)
+        self.tv_origem.bind("<Double-1>", self._editar_valor_origem)
+
+        # ---- Painel direito: campos do DESTINO ----
+        ttk.Label(dir_, text="DESTINO — campos do formulário e mapeamento",
+                  style="Titulo.TLabel").pack(anchor="w", padx=10, pady=(10, 2))
+        self.frame_campos = ttk.Frame(dir_)
+        canvas = tk.Canvas(dir_, highlightthickness=0, bg=COR_PAINEL)
+        scroll_d = ttk.Scrollbar(dir_, orient="vertical", command=canvas.yview)
+        self.frame_campos.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.frame_campos, anchor="nw")
+        canvas.configure(yscrollcommand=scroll_d.set)
+        canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        scroll_d.pack(side="right", fill="y", pady=10)
+        # Largura dos comboboxes acompanha o painel
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(0, width=e.width - 20))
+
+    # --------------------------------------------------------- ações de carga
+    def carregar_origem(self) -> None:
+        """Diálogo .pdf/.txt -> extrator completo -> preenche a tabela esquerda."""
+        caminho = filedialog.askopenfilename(
+            title="Documento de origem",
+            filetypes=[("Documentos", "*.pdf *.txt"), ("PDF", "*.pdf"), ("TXT", "*.txt")])
+        if not caminho:
+            return
+        senha: Optional[str] = None
+        try:
+            res = extrair_documento(caminho, senha=senha)
+        except PermissionError:
+            senha = simpledialog_get_password(self.root, "PDF protegido",
+                                              "Digite a senha do PDF:")
+            if not senha:
+                messagebox.showerror("Erro", "PDF exige senha.")
+                return
+            try:
+                res = extrair_documento(caminho, senha=senha)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Erro", f"Falha ao ler PDF: {exc}")
+                return
+        except Exception as exc:  # FileNotFoundError, ValueError...
+            messagebox.showerror("Erro", str(exc))
+            return
+
+        self.resultado = res
+        self._renderir_origem(res)
+        aviso = ("  ⚠ " + "; ".join(res.avisos)) if res.avisos else ""
+        self._set_status(f"{len(res.dados)} pares extraídos de {Path(caminho).name}.{aviso}")
+        self._reatualizar_mapeamentos()
+
+    def carregar_destino(self) -> None:
+        """Escolhe Web (URL) ou arquivo (PDF/TXT template) como destino."""
+        escolha = messagebox.askyesno(
+            "Tipo de destino",
+            "Sim = Formulário Web (URL)\nNão = Arquivo PDF/TXT (template)")
+        if escolha is None:
+            return
+        if escolha:
+            url = simpledialog_askstring(self.root, "URL do formulário",
+                                         "https://exemplo.com/formulario")
+            if not url:
+                return
+            self.destino_url, self.destino_arquivo = url, None
+            self._set_status(f"Inspecionando {url} ...")
+            threading.Thread(target=self._carregar_web_bg, args=(url,),
+                             daemon=True).start()
+        else:
+            caminho = filedialog.askopenfilename(
+                title="Template de destino",
+                filetypes=[("Templates", "*.pdf *.txt"), ("PDF", "*.pdf"), ("TXT", "*.txt")])
+            if not caminho:
+                return
+            self.destino_arquivo, self.destino_url = Path(caminho), None
+            try:
+                if caminho.lower().endswith(".pdf"):
+                    self.campos_destino = PreenchedorPDF(caminho).coletar_campos()
+                else:
+                    self.campos_destino = PreenchedorTXT(caminho).coletar_campos()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Erro", f"Falha ao inspecionar destino: {exc}")
+                return
+            if not self.campos_destino:
+                messagebox.showwarning(
+                    "Destino visual",
+                    "O PDF não tem campos AcroForm.\nPara preenchimento visual, "
+                    "edite os valores na ORIGEM e use 'Executar'; coordenadas "
+                    "podem ser adicionadas programaticamente via CampoDestino.")
+            self._reatualizar_mapeamentos()
+            self._set_status(f"{len(self.campos_destino)} campos de destino carregados.")
+
+    def _carregar_web_bg(self, url: str) -> None:
+        """Thread: coleta campos web sem travar a UI."""
+        try:
+            campos = PreenchedorWeb(headless=True).coletar_campos(url)
+            self.root.after(0, self._on_web_campos, campos, url, None)
+        except Exception as exc:  # ConnectionError, RuntimeError...
+            self.root.after(0, self._on_web_campos, [], url, exc)
+
+    def _on_web_campos(self, campos: list[CampoDestino], url: str,
+                       erro: Optional[Exception]) -> None:
+        """Callback main-thread para resultado da inspeção web."""
+        if erro:
+            messagebox.showerror("Destino Web", f"Não foi possível acessar:\n{erro}")
+            self._set_status("Falha ao carregar destino web.")
+            return
+        self.campos_destino = campos
+        self._reatualizar_mapeamentos()
+        self._set_status(f"{len(campos)} campos web detectados em {url}.")
+
+    # ------------------------------------------------------------ renderização
+    def _renderir_origem(self, res: ResultadoExtracao) -> None:
+        """Preenche a Treeview da origem com todos os DadoExtraido."""
+        self.tv_origem.delete(*self.tv_origem.get_children())
+        for d in res.dados:
+            self.tv_origem.insert(
+                "", "end", iid=d.chave_original,
+                values=(d.chave_original, d.valor, d.fonte,
+                        f"{d.confianca:.0%}", d.pagina or "-"))
+
+    def _sincronizar_valores_ui(self) -> None:
+        """Copia edições feitas na tabela para os objetos DadoExtraido."""
+        if not self.resultado:
+            return
+        por_chave = {d.chave_original: d for d in self.resultado.dados}
+        for iid in self.tv_origem.get_children():
+            vals = self.tv_origem.item(iid, "values")
+            chave, novo_valor = vals[0], vals[1]
+            if chave in por_chave and por_chave[chave].valor != novo_valor:
+                por_chave[chave].valor = novo_valor
+                por_chave[chave].confianca = min(1.0, por_chave[chave].confianca)
+
+    def _reatualizar_mapeamentos(self) -> None:
+        """Roda o mapeador semântico e redesenha o painel direito."""
+        self._sincronizar_valores_ui()
+        for w in self.frame_campos.winfo_children():
+            w.destroy()
+        self.mapas = []
+        if not self.campos_destino:
+            ttk.Label(self.frame_campos,
+                      text="Nenhum destino carregado. Use 'Carregar Destino'.",
+                      foreground="#6b7280").pack(padx=12, pady=20)
+            return
+        dados = self.resultado.dados if self.resultado else []
+        self.mapas = self.mapeador.mapear(self.campos_destino, dados)
+        for m in self.mapas:
+            self._linha_campo(m, dados)
+
+    def _linha_campo(self, m: MapeamentoCampo, dados: list[DadoExtraido]) -> None:
+        """Uma linha do painel direito: rótulo, valor, barra de confiança, dropdown."""
+        frame = ttk.Frame(self.frame_campos)
+        frame.pack(fill="x", padx=10, pady=6)
+
+        cor = COR_OK if m.status == StatusCampo.OK else (
+            COR_WARN if m.status == StatusCampo.REVISAO else "#6b7280")
+        tag = " ✔" if m.status == StatusCampo.OK else (
+            " ⚠ revisão" if m.status == StatusCampo.REVISAO else " ✖ sem dado")
+        ttk.Label(frame, text=m.campo.rotulo + tag, foreground=cor,
+                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text=f"confiança: {m.score:.0%}", foreground=cor
+                  ).grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+        var = tk.StringVar(value=m.valor_final)
+        ent = ttk.Entry(frame, textvariable=var, width=42)
+        ent.grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 2))
+        ent.bind("<FocusOut>", lambda e, mm=m, vv=var: self._ao_editar_valor(mm, vv.get()))
+
+        pb = ttk.Progressbar(frame, length=120, mode="determinate",
+                             value=int(m.score * 100))
+        estilo_pb = ("Verde" if m.status == StatusCampo.OK else
+                     "Laranja" if m.status == StatusCampo.REVISAO else "Cinza")
+        pb.configure(style=f"{estilo_pb}.Horizontal.TProgressbar")
+        pb.grid(row=2, column=0, sticky="w", pady=(0, 4))
+
+        chaves = [d.chave_original for d in dados]
+        cbv = tk.StringVar(value=(m.dado.chave_original if m.dado else ""))
+        combo = ttk.Combobox(frame, values=["— nenhum —"] + chaves,
+                             textvariable=cbv, state="readonly", width=28)
+        combo.grid(row=2, column=1, columnspan=2, sticky="e", pady=(0, 4))
+        combo.bind("<<ComboboxSelected>>",
+                   lambda e, mm=m, cc=cbv, vv=var: self._remapear_manual(mm, cc.get(), vv))
+        frame.columnconfigure(0, weight=1)
+
+    # ------------------------------------------------------------- interações
+    def _editar_valor_origem(self, event: Any) -> None:
+        """Edição inline da coluna Valor na tabela de origem (duplo clique)."""
+        tv = self.tv_origem
+        regiao = tv.identify_region(event.x, event.y)
+        if regiao != "cell":
+            return
+        col_id = tv.identify_column(event.x)
+        if col_id != "#2":  # apenas a coluna Valor é editável
+            return
+        iid = tv.identify_row(event.y)
+        if not iid:
+            return
+        x, y, w, h = tv.bbox(iid, col_id)
+        entry = ttk.Entry(tv)
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.insert(0, tv.set(iid, "valor"))
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+
+        def confirmar(_ev: Any = None) -> None:
+            tv.set(iid, "valor", entry.get())
+            entry.destroy()
+            self._reatualizar_mapeamentos()
+
+        entry.bind("<Return>", confirmar)
+        entry.bind("<FocusOut>", confirmar)
+        entry.bind("<Escape>", lambda e: entry.destroy())
+
+    def _ao_editar_valor(self, m: MapeamentoCampo, novo: str) -> None:
+        """Usuário corrigiu manualmente o valor previsto de um campo destino."""
+        if novo != m.valor_final:
+            m.valor_final = novo
+            if m.status in (StatusCampo.REVISAO, StatusCampo.SEM_DADO) and novo:
+                m.status = StatusCampo.OK
+                m.score = max(m.score, 0.80)
+            self._reatualizar_mapeamentos()
+
+    def _remapear_manual(self, m: MapeamentoCampo, chave: str,
+                         var_valor: tk.StringVar) -> None:
+        """Dropdown escolheu outro dado da origem -> override manual (100%)."""
+        if not self.resultado:
+            return
+        if chave == "— nenhum —":
+            m.dado, m.valor_final, m.score = None, "", 0.0
+            m.status = StatusCampo.SEM_DADO
+        else:
+            d = next((x for x in self.resultado.dados
+                      if x.chave_original == chave), None)
+            if d:
+                m.dado, m.valor_final, m.score = d, d.valor, 1.0
+                m.status = StatusCampo.OK
+        var_valor.set(m.valor_final)
+        self._reatualizar_mapeamentos()
+
+    # --------------------------------------------------------------- execução
+    def _executar_preenchimento(self, dry_run: bool) -> None:
+        """Valida pré-requisitos e delega ao executor correto em thread."""
+        self._sincronizar_valores_ui()
+        if not self.mapas:
+            messagebox.showwarning("Nada a fazer",
+                                   "Carregue origem E destino antes de preencher.")
+            return
+        pendentes = [m for m in self.mapas if m.precisa_revisao and not m.valor_final]
+        if not dry_run and pendentes:
+            if not messagebox.askyesno(
+                    "Campos sem revisão",
+                    f"{len(pendentes)} campo(s) ainda marcados para revisão serão "
+                    "pulados. Continuar assim mesmo?"):
+                return
+        rotulo = "SIMULAÇÃO" if dry_run else "EXECUÇÃO"
+        self._set_status(f"[{rotulo}] processando ...")
+        threading.Thread(target=self._run_fill_bg, args=(dry_run,),
+                         daemon=True).start()
+
+    def _run_fill_bg(self, dry_run: bool) -> None:
+        """Chama o executor adequado (web/pdf/txt) fora da main thread."""
+        try:
+            if self.destino_url:
+                mapas = PreenchedorWeb().preencher(self.destino_url, self.mapas, dry_run)
+                msg = (f"[{dry_run and 'SIMULAÇÃO' or 'EXECUÇÃO'}] web concluída — "
+                       f"resultado_web.png salvo.")
+            elif self.destino_arquivo and self.destino_arquivo.suffix.lower() == ".pdf":
+                saida = self.destino_arquivo.with_name(
+                    ("dryrun_" if dry_run else "") + "saida_" + self.destino_arquivo.name)
+                out = PreenchedorPDF(self.destino_arquivo).preencher(
+                    self.mapas, saida, dry_run)
+                mapas, msg = self.mapas, f"PDF gerado: {out}"
+            elif self.destino_arquivo:
+                saida = self.destino_arquivo.with_name(
+                    ("dryrun_" if dry_run else "") + "saida_" + self.destino_arquivo.name)
+                out = PreenchedorTXT(self.destino_arquivo).preencher(
+                    self.mapas, saida, dry_run)
+                mapas, msg = self.mapas, f"TXT gerado: {out}"
+            else:
+                mapas, msg = self.mapas, "Nenhum destino configurado."
+            self.root.after(0, self._on_fill_done, mapas, msg, None)
+        except Exception as exc:  # noqa: BLE001
+            self.root.after(0, self._on_fill_done, self.mapas, "", exc)
+
+    def _on_fill_done(self, mapas: list[MapeamentoCampo], msg: str,
+                      erro: Optional[Exception]) -> None:
+        """Atualiza painel direito com status final (verde/laranja)."""
+        self.mapas = mapas
+        if erro:
+            messagebox.showerror("Falha no preenchimento", str(erro))
+            self._set_status(f"Erro: {erro}")
+        else:
+            self._set_status(msg)
+        self._reatualizar_mapeamentos()
+        ok = sum(1 for m in mapas if m.status in (StatusCampo.PREENCHIDO, StatusCampo.OK))
+        falha = sum(1 for m in mapas if m.status in (StatusCampo.FALHA, StatusCampo.REVISAO))
+        logger.info("Fill finalizado: %d ok / %d pendentes", ok, falha)
+
+    # ---------------------------------------------------------------- helpers
+    def _set_status(self, texto: str) -> None:
+        """Atualiza a barra de status inferior."""
+        self.status_var.set(texto)
+
+
+# ---------------------------------------------------------------------------
+# Wrappers de simpledialog (import tardio mantém módulo leve p/ testes headless)
+# ---------------------------------------------------------------------------
+def simpledialog_get_password(parent: Any, title: str, prompt: str) -> Optional[str]:
+    """Pede senha de PDF criptografado."""
+    from tkinter import simpledialog
+    return simpledialog.askstring(title, prompt, show="*", parent=parent)
+
+
+def simpledialog_askstring(parent: Any, title: str, initial: str) -> Optional[str]:
+    """Pede uma URL de formulário web."""
+    from tkinter import simpledialog
+    return simpledialog.askstring(title, "URL do formulário:",
+                                  initialvalue=initial, parent=parent)
+
+
+def main() -> None:
+    """Ponto de entrada da aplicação."""
+    root = tk.Tk()
+    AplicacaoPreenchimento(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
